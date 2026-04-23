@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Manager.io - Advanced Business Management System for Sales, Purchases, Inventory and more.">
+    <title>Manager.io - Business Management System</title>
+    <!-- Google Fonts: Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Supabase Client JS -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <!-- Chart.js for dashboard charts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- html2pdf for invoice generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <!-- PouchDB for local database -->
+    <script src="https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/dist/pouchdb.min.js"></script>
+    <!-- SheetJS for Excel export -->
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Auth View -->
+        <div id="auth-container" class="view hidden">
+            <div class="auth-card">
+                <div class="auth-logo-area">
+                    <div class="auth-logo-icon"><i class="fas fa-chart-line"></i></div>
+                    <h2>Manager.io</h2>
+                    <p class="auth-subtitle">Sign in to your business dashboard</p>
+                </div>
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" required placeholder="Enter your email">
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" required placeholder="Enter your password">
+                    </div>
+                    <button type="submit" class="btn-primary"><i class="fas fa-sign-in-alt"></i> Login</button>
+                </form>
+                <div class="auth-footer">
+                    <a href="#" id="forgot-password-link">Forgot Password?</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Application View -->
+        <div id="main-view" class="view hidden">
+            <!-- Mobile sidebar overlay -->
+            <div id="sidebar-overlay"></div>
+            <aside id="sidebar">
+                <div class="sidebar-header">
+                    <div class="sidebar-logo-container">
+                        <img id="sidebar-logo" src="" alt="" style="display: none;">
+                        <div id="sidebar-logo-placeholder" class="logo-placeholder">M</div>
+                    </div>
+                    <h1 id="sidebar-company-name">Manager.io</h1>
+                </div>
+                <nav>
+                    <ul>
+                        <li class="active" data-view="dashboard"><i class="fas fa-chart-line"></i> Dashboard</li>
+                        <li data-view="sales"><i class="fas fa-shopping-cart"></i> Sales</li>
+                        <li data-view="purchases"><i class="fas fa-truck"></i> Purchases</li>
+                        <li data-view="inventory"><i class="fas fa-boxes"></i> Inventory</li>
+                        <li data-view="customers"><i class="fas fa-users"></i> Customers</li>
+                        <li data-view="suppliers"><i class="fas fa-truck-field"></i> Suppliers</li>
+                        <li data-view="expenses"><i class="fas fa-receipt"></i> Expenses</li>
+                        <li data-view="reports"><i class="fas fa-file-invoice-dollar"></i> Reports</li>
+                        <li data-view="profile"><i class="fas fa-building"></i> Profile</li>
+                        <li data-view="users" id="nav-users" class="hidden"><i class="fas fa-user-shield"></i> Users</li>
+                    </ul>
+                </nav>
+                <div class="sidebar-footer">
+                    <button id="logout-btn"><i class="fas fa-sign-out-alt"></i> Logout</button>
+                </div>
+            </aside>
+
+            <main id="content">
+                <header id="top-header">
+                    <div style="display:flex;align-items:center;gap:0.5rem;">
+                        <button id="hamburger-btn" aria-label="Toggle sidebar"><i class="fas fa-bars"></i></button>
+                        <h2 id="view-title">Dashboard</h2>
+                    </div>
+                    <div class="user-info">
+                        <span id="user-role">Admin</span>
+                        <span id="user-email">user@example.com</span>
+                        <div class="user-avatar" id="user-avatar-icon"><i class="fas fa-user" style="font-size:0.75rem"></i></div>
+                    </div>
+                </header>
+                <div id="module-container">
+                    <!-- Modules will be loaded here -->
+                    <div id="dashboard-view" class="module">
+                        <div class="module-filter-bar dashboard-filter-bar">
+                            <div class="filter-group">
+                                <label><i class="fas fa-calendar-alt"></i> Dashboard Period:</label>
+                                <select id="dash-period" onchange="handleDashboardFilterChange()">
+                                    <option value="Today">Today</option>
+                                    <option value="Last7Days">Last 7 Days</option>
+                                    <option value="ThisMonth" selected>This Month</option>
+                                    <option value="LastMonth">Last Month</option>
+                                    <option value="ThisYear">This Year</option>
+                                    <option value="All">All Time</option>
+                                    <option value="Custom">Custom Range</option>
+                                </select>
+                            </div>
+                            <div id="dash-custom-dates" class="filter-group hidden">
+                                <input type="date" id="dash-start-date" onchange="applyDashboardFilters()">
+                                <span>to</span>
+                                <input type="date" id="dash-end-date" onchange="applyDashboardFilters()">
+                            </div>
+                        </div>
+
+                        <!-- Section 1: Financial Health -->
+                        <div class="dashboard-section">
+                            <h2 class="section-title"><i class="fas fa-heartbeat"></i> Financial Health Overview</h2>
+                            <div class="stats-grid dashboard-stats-grid">
+                                <div class="stat-card kpi-card revenue">
+                                    <div class="kpi-icon"><i class="fas fa-money-bill-wave"></i></div>
+                                    <div class="kpi-content">
+                                        <h3>Gross Revenue</h3>
+                                        <p class="stat-value" id="dash-revenue">₹ 0.00</p>
+                                    </div>
+                                </div>
+                                <div class="stat-card kpi-card expense">
+                                    <div class="kpi-icon"><i class="fas fa-receipt"></i></div>
+                                    <div class="kpi-content">
+                                        <h3>Total Expenses</h3>
+                                        <p class="stat-value" id="dash-expenses">₹ 0.00</p>
+                                    </div>
+                                </div>
+                                <div class="stat-card kpi-card profit">
+                                    <div class="kpi-icon"><i class="fas fa-hand-holding-usd"></i></div>
+                                    <div class="kpi-content">
+                                        <h3>Net Profit</h3>
+                                        <p class="stat-value" id="dash-profit">₹ 0.00</p>
+                                    </div>
+                                </div>
+                                <div class="stat-card kpi-card margin">
+                                    <div class="kpi-icon"><i class="fas fa-percentage"></i></div>
+                                    <div class="kpi-content">
+                                        <h3>Net Margin</h3>
+                                        <p class="stat-value" id="dash-margin">0%</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="dashboard-main-grid">
+                            <!-- Section: Sales Trend -->
+                            <div class="dashboard-card chart-card">
+                                <h3><i class="fas fa-chart-line"></i> Sales Performance Trend</h3>
+                                <div class="chart-container">
+                                    <canvas id="salesChart"></canvas>
+                                </div>
+                            </div>
+
+                            <!-- Section: Top Selling Products -->
+                            <div class="dashboard-card list-card">
+                                <h3><i class="fas fa-trophy"></i> Top 5 Products (by Revenue)</h3>
+                                <div class="dash-list-container" id="dash-top-products">
+                                    <p class="text-muted">Loading analytics...</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="dashboard-secondary-grid">
+                            <!-- Section: Top Customers -->
+                            <div class="dashboard-card list-card">
+                                <h3><i class="fas fa-user-tie"></i> Top Customers</h3>
+                                <div class="dash-list-container" id="dash-top-customers">
+                                    <p class="text-muted">Loading analytics...</p>
+                                </div>
+                            </div>
+
+                            <!-- Section: Expense Breakdown -->
+                            <div class="dashboard-card chart-card-small">
+                                <h3><i class="fas fa-pie-chart"></i> Expenses by Category</h3>
+                                <div class="chart-container chart-small">
+                                    <canvas id="expenseChart"></canvas>
+                                </div>
+                            </div>
+
+                            <!-- Section: Operations -->
+                            <div class="dashboard-card ops-card">
+                                <h3><i class="fas fa-tasks"></i> Operational Health</h3>
+                                <div class="ops-stats">
+                                    <div class="ops-stat-item">
+                                        <span>Low Stock Items:</span>
+                                        <strong id="dash-low-stock" class="text-danger">0</strong>
+                                    </div>
+                                    <div class="ops-stat-item">
+                                        <span>Pending Receivables:</span>
+                                        <strong id="dash-pending-rev">₹ 0.00</strong>
+                                    </div>
+                                    <div class="ops-stat-item">
+                                        <span>Pending Payables:</span>
+                                        <strong id="dash-pending-pay">₹ 0.00</strong>
+                                    </div>
+                                    <div class="ops-stat-item">
+                                        <span>Inventory Value:</span>
+                                        <strong id="dash-inv-value">₹ 0.00</strong>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sales Module -->
+                    <div id="sales-view" class="module hidden">
+                        <div class="module-filter-bar">
+                            <div class="filter-group">
+                                <label>Period:</label>
+                                <select id="sales-period" onchange="handlePeriodChange('sales')">
+                                    <option value="All">All Time</option>
+                                    <option value="Today">Today</option>
+                                    <option value="ThisMonth">This Month</option>
+                                    <option value="LastMonth">Last Month</option>
+                                    <option value="Custom">Custom Range</option>
+                                </select>
+                            </div>
+                            <div id="sales-custom-dates" class="filter-group hidden">
+                                <input type="date" id="sales-start-date" onchange="applyModuleFilters('sales')">
+                                <span>to</span>
+                                <input type="date" id="sales-end-date" onchange="applyModuleFilters('sales')">
+                            </div>
+                        </div>
+                        <div class="stats-grid module-stats-grid" id="sales-stats">
+                            <div class="stat-card"><h3>Total Invoiced</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Received</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Pending</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Taxable Value</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Total Tax</h3><p class="stat-value">₹ 0.00</p></div>
+                        </div>
+                        <div class="module-header">
+                            <h2>Sales Management</h2>
+                            <div class="header-actions">
+                                <div class="search-container">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="sales-search" placeholder="Search by Invoice/Customer..." oninput="handleSearch('sales', this.value)">
+                                </div>
+                                <button class="btn-success" onclick="exportSalesToExcel()"><i class="fas fa-file-excel"></i> Export to Excel</button>
+                                <button class="btn-primary" onclick="openNewSaleModal()"><i class="fas fa-plus"></i> New Sale</button>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table id="sales-table">
+                                <thead>
+                                    <tr>
+                                        <th>Invoice #</th>
+                                        <th>Date</th>
+                                        <th>Customer</th>
+                                        <th>Total</th>
+                                        <th>Received</th>
+                                        <th>Pending</th>
+                                        <th>Status</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="sales-list">
+                                    <!-- Sales items will be loaded here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Purchases Module -->
+                    <div id="purchases-view" class="module hidden">
+                        <div class="module-filter-bar">
+                            <div class="filter-group">
+                                <label>Period:</label>
+                                <select id="pur-period" onchange="handlePeriodChange('pur')">
+                                    <option value="All">All Time</option>
+                                    <option value="Today">Today</option>
+                                    <option value="ThisMonth">This Month</option>
+                                    <option value="LastMonth">Last Month</option>
+                                    <option value="Custom">Custom Range</option>
+                                </select>
+                            </div>
+                            <div id="pur-custom-dates" class="filter-group hidden">
+                                <input type="date" id="pur-start-date" onchange="applyModuleFilters('pur')">
+                                <span>to</span>
+                                <input type="date" id="pur-end-date" onchange="applyModuleFilters('pur')">
+                            </div>
+                        </div>
+                        <div class="stats-grid module-stats-grid" id="pur-stats">
+                            <div class="stat-card"><h3>Total Invoiced</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Paid</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Pending</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Taxable Value</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Total Tax</h3><p class="stat-value">₹ 0.00</p></div>
+                        </div>
+                        <div class="module-header">
+                            <h2>Purchase Management</h2>
+                            <div class="header-actions">
+                                <div class="search-container">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="purchases-search" placeholder="Search by Order/Supplier..." oninput="handleSearch('purchases', this.value)">
+                                </div>
+                                <button class="btn-success" onclick="exportPurchasesToExcel()"><i class="fas fa-file-excel"></i> Export to Excel</button>
+                                <button class="btn-primary" onclick="openNewPurchaseModal()"><i class="fas fa-plus"></i> New Purchase</button>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table id="purchases-table">
+                                <thead>
+                                    <tr>
+                                        <th>Order #</th>
+                                        <th>Date</th>
+                                        <th>Supplier</th>
+                                        <th>Total</th>
+                                        <th>Paid</th>
+                                        <th>Pending</th>
+                                        <th>Status</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="purchases-list">
+                                    <!-- Purchase items will be loaded here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Inventory Module -->
+                    <div id="inventory-view" class="module hidden">
+                        <div class="module-header">
+                            <h2>Inventory Management</h2>
+                            <div class="header-actions">
+                                <div class="search-container">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="inventory-search" placeholder="Search by Product/SKU..." oninput="handleSearch('inventory', this.value)">
+                                </div>
+                                <button class="btn-primary" onclick="openAddItemModal()"><i class="fas fa-plus"></i> Add Product</button>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table id="inventory-table">
+                                <thead>
+                                    <tr>
+                                        <th>Product Name</th>
+                                        <th>SKU</th>
+                                        <th>Stock Level</th>
+                                        <th>Price</th>
+                                        <th>Category</th>
+                                        <th>Min Stock</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="inventory-list">
+                                    <!-- Inventory items will be loaded here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Customers Module -->
+                    <div id="customers-view" class="module hidden">
+                        <div class="module-header">
+                            <h2>Customer Management</h2>
+                            <div class="header-actions">
+                                <div class="search-container">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="customers-search" placeholder="Search by Name/Phone..." oninput="handleSearch('customers', this.value)">
+                                </div>
+                                <button class="btn-primary" onclick="openAddCustomerModal()"><i class="fas fa-plus"></i> Add Customer</button>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>GSTIN</th>
+                                        <th>Phone</th>
+                                        <th>Email</th>
+                                        <th>Address</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="customers-list"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Suppliers Module -->
+                    <div id="suppliers-view" class="module hidden">
+                        <div class="module-header">
+                            <h2>Supplier Management</h2>
+                            <div class="header-actions">
+                                <div class="search-container">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="suppliers-search" placeholder="Search by Name/Phone..." oninput="handleSearch('suppliers', this.value)">
+                                </div>
+                                <button class="btn-primary" onclick="openAddSupplierModal()"><i class="fas fa-plus"></i> Add Supplier</button>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>GSTIN</th>
+                                        <th>Phone</th>
+                                        <th>Email</th>
+                                        <th>Address</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="suppliers-list"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Expenses Module -->
+                    <div id="expenses-view" class="module hidden">
+                        <div class="module-filter-bar">
+                            <div class="filter-group">
+                                <label>Period:</label>
+                                <select id="exp-period" onchange="handlePeriodChange('exp')">
+                                    <option value="All">All Time</option>
+                                    <option value="Today">Today</option>
+                                    <option value="ThisMonth">This Month</option>
+                                    <option value="LastMonth">Last Month</option>
+                                    <option value="Custom">Custom Range</option>
+                                </select>
+                            </div>
+                            <div id="exp-custom-dates" class="filter-group hidden">
+                                <input type="date" id="exp-start-date" onchange="applyModuleFilters('exp')">
+                                <span>to</span>
+                                <input type="date" id="exp-end-date" onchange="applyModuleFilters('exp')">
+                            </div>
+                        </div>
+                        <div class="stats-grid module-stats-grid" id="exp-stats">
+                            <div class="stat-card"><h3>Total Expenses</h3><p class="stat-value">₹ 0.00</p></div>
+                        </div>
+                        <div class="module-header">
+                            <h2>Expense Management</h2>
+                            <div class="header-actions">
+                                <div class="search-container">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="expenses-search" placeholder="Search Expenses..." oninput="handleSearch('expenses', this.value)">
+                                </div>
+                                <button class="btn-primary" onclick="openAddExpenseModal()"><i class="fas fa-plus"></i> Add Expense</button>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Date</th>
+                                        <th>Category</th>
+                                        <th>Description</th>
+                                        <th>Amount</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="expenses-list"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <!-- Reports Module -->
+                    <div id="reports-view" class="module hidden">
+                        <div class="module-header">
+                            <h2>Business Reports & Analytics</h2>
+                        </div>
+                        <div class="reports-grid">
+                            <div class="report-card" onclick="generateSalesReport()">
+                                <i class="fas fa-chart-line fa-2x"></i>
+                                <h3>Sales Report</h3>
+                                <p>Detailed history of all sales transactions.</p>
+                            </div>
+                            <div class="report-card" onclick="generatePurchaseReport()">
+                                <i class="fas fa-truck fa-2x"></i>
+                                <h3>Purchase Report</h3>
+                                <p>Detailed history of all purchase transactions.</p>
+                            </div>
+                            <div class="report-card" onclick="generateInventoryReport()">
+                                <i class="fas fa-boxes fa-2x"></i>
+                                <h3>Inventory Report</h3>
+                                <p>Current stock status and valuation.</p>
+                            </div>
+                            <div class="report-card" onclick="generateProfitLossReport()">
+                                <i class="fas fa-hand-holding-dollar fa-2x"></i>
+                                <h3>Profit & Loss</h3>
+                                <p>Overview of revenue vs. expenses.</p>
+                            </div>
+                            <div class="report-card" onclick="generateExpenseReport()">
+                                <i class="fas fa-receipt fa-2x"></i>
+                                <h3>Expense Report</h3>
+                                <p>Breakdown of business operational costs.</p>
+                            </div>
+                        </div>
+                        <div id="report-results" class="table-container hidden" style="margin-top: 2rem;">
+                            <div class="module-filter-bar">
+                                <div class="filter-group">
+                                    <label>Period:</label>
+                                    <select id="report-period" onchange="applyReportFilters()">
+                                        <option value="All">All Time</option>
+                                        <option value="Today">Today</option>
+                                        <option value="ThisMonth">This Month</option>
+                                        <option value="LastMonth">Last Month</option>
+                                        <option value="Custom">Custom Range</option>
+                                    </select>
+                                </div>
+                                <div id="report-custom-dates" class="filter-group hidden">
+                                    <input type="date" id="report-start-date" onchange="applyReportFilters()">
+                                    <span>to</span>
+                                    <input type="date" id="report-end-date" onchange="applyReportFilters()">
+                                </div>
+                            </div>
+                            <div class="report-header-print">
+                                <h3 id="report-title-text">Report Title</h3>
+                                <p id="report-date-text"></p>
+                            </div>
+                            <table id="report-table">
+                                <thead id="report-thead"></thead>
+                                <tbody id="report-tbody"></tbody>
+                            </table>
+                            <div id="report-summary" class="totals-section"></div>
+                            <div style="margin-top: 1rem; text-align: right; display: flex; justify-content: flex-end; gap: 1rem;">
+                                 <button class="btn-success" id="report-excel-btn" onclick="exportReportToExcel()" style="width: auto; display: none;">
+                                     <i class="fas fa-file-excel"></i> Export to Excel
+                                 </button>
+                                 <button class="btn-primary" onclick="printReport()" style="width: auto;">
+                                     <i class="fas fa-print"></i> Print Report
+                                 </button>
+                             </div>
+                         </div>
+                     </div>
+
+ 
+
+                    <!-- Profile Module -->
+                     <div id="profile-view" class="module hidden">
+                        <div class="module-header">
+                            <h2>Company Profile</h2>
+                        </div>
+                        <div class="table-container" style="padding: 2rem;">
+                            <form id="profile-form">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Company Name (Display)</label>
+                                        <input type="text" id="prof-name">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Company Legal Name</label>
+                                        <input type="text" id="prof-legal-name">
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Company Logo (PNG/JPG only)</label>
+                                        <input type="file" id="prof-logo-file" accept="image/png, image/jpeg">
+                                        <img id="prof-logo-preview" src="" alt="Logo Preview" class="image-preview">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>GSTIN</label>
+                                        <input type="text" id="prof-gstin" required>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Address</label>
+                                    <textarea id="prof-address" rows="3" required></textarea>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Phone</label>
+                                        <input type="text" id="prof-phone" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Email</label>
+                                        <input type="email" id="prof-email" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>State</label>
+                                        <input type="text" id="prof-state" required>
+                                    </div>
+                                </div>
+                                <hr style="margin: 2rem 0; border: none; border-top: 1px solid var(--border-color);">
+                                <h3>Bank & Signature Details</h3>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Bank Name</label>
+                                        <input type="text" id="prof-bank-name" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Account Number</label>
+                                        <input type="text" id="prof-account-no" required>
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>IFSC Code</label>
+                                        <input type="text" id="prof-ifsc" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Account Holder Name</label>
+                                        <input type="text" id="prof-holder" required>
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Bank QR Code (PNG/JPG only)</label>
+                                        <input type="file" id="prof-qr-file" accept="image/png, image/jpeg">
+                                        <img id="prof-qr-preview" src="" alt="QR Preview" class="image-preview qr-preview">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Authorized Signature (PNG/JPG only)</label>
+                                        <input type="file" id="prof-sig-file" accept="image/png, image/jpeg">
+                                        <img id="prof-sig-preview" src="" alt="Signature Preview" class="image-preview" style="max-height: 60px;">
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Terms and Conditions</label>
+                                    <textarea id="prof-terms" rows="2" required></textarea>
+                                </div>
+                                <div style="text-align: right; margin-top: 2rem;">
+                                    <button type="submit" class="btn-primary" style="width: auto;">
+                                        <i class="fas fa-save"></i> Save Profile Details
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                     </div>
+
+                     <!-- Users Module (Admin only) -->
+                     <div id="users-view" class="module hidden">
+                        <!-- Tab Navigation -->
+                        <div class="users-tabs-nav">
+                            <button class="users-tab-btn active" data-tab="users-tab-list" onclick="switchUsersTab('users-tab-list', this)">
+                                <i class="fas fa-users"></i> User Accounts
+                            </button>
+                            <button class="users-tab-btn" data-tab="users-tab-roles" onclick="switchUsersTab('users-tab-roles', this)">
+                                <i class="fas fa-shield-alt"></i> Role Settings
+                            </button>
+                        </div>
+
+                        <!-- User Accounts Tab -->
+                        <div id="users-tab-list" class="users-tab-panel">
+                            <div class="module-header">
+                                <h2>User Accounts</h2>
+                                <button class="btn-primary" onclick="openAddUserModal()" style="width:auto;"><i class="fas fa-plus"></i> Add New User</button>
+                            </div>
+                            <div class="table-container">
+                                <div class="table-wrapper">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Email</th>
+                                                <th>Role</th>
+                                                <th>Last Login</th>
+                                                <th>Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="users-list"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Role Settings Tab -->
+                        <div id="users-tab-roles" class="users-tab-panel hidden">
+                            <div class="module-header">
+                                <h2>Role Permission Settings</h2>
+                                <button class="btn-primary" onclick="saveRoleSettingsUI()" style="width:auto;">
+                                    <i class="fas fa-save"></i> Save Changes
+                                </button>
+                            </div>
+                            <div class="role-settings-info">
+                                <i class="fas fa-info-circle"></i>
+                                Configure which modules each role can access. Admins always have full access. Changes take effect immediately after saving.
+                            </div>
+                            <div id="role-settings-container">
+                                <!-- Rendered by JavaScript -->
+                            </div>
+                        </div>
+                     </div>
+                  </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Toast Notifications Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Modals -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h2 id="modal-title">New Sale</h2>
+                <button class="close-modal" onclick="closeModal()">&times;</button>
+            </div>
+            <div id="modal-content" class="modal-body">
+                <!-- Dynamic modal content -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden Invoice Template for PDF Generation -->
+    <div id="invoice-template" class="hidden">
+        <div class="gst-invoice-container">
+            <div class="gst-invoice-title">Tax Invoice</div>
+            
+            <div class="gst-header-section">
+                <div class="gst-company-brand">
+                    <div class="gst-logo-container">
+                        <img id="gst-company-logo-img" src="" alt="Logo" style="display: none;">
+                    </div>
+                    <div class="gst-company-name-main" id="gst-company-name">Digital Consortium</div>
+                </div>
+                <div class="gst-company-details">
+                    <div class="gst-company-name-header" id="gst-company-legal-name">DIGITAL CONSORTIUM</div>
+                    <div id="gst-company-address">Plot 1/C | Level 6 | T Hub | Raidurgam | Hyderabad | Telangana 500081</div>
+                    <div id="gst-company-contact">Phone no.: 8179232111 Email: info@dcindia.co</div>
+                    <div>GSTIN: <span id="gst-company-gstin">36AFQPC8107F2ZH</span>, State: <span id="gst-company-state">36-Telangana</span></div>
+                </div>
+            </div>
+
+            <div class="gst-bill-ship-row">
+                <div class="gst-bill-to">
+                    <div class="gst-section-label">Bill To</div>
+                    <div class="gst-customer-name-bold" id="gst-bill-name">Quess Corp Limited</div>
+                    <div id="gst-bill-address">
+                        MIDC Indus Area, Rebale, Navi Mumbai<br>
+                        Sigma IT park, TTC industrial estate,<br>
+                        Ghansoli Buhari Marg, Belapur road,sec-8<br>
+                        Thane-400701
+                    </div>
+                    <div>GSTIN : <span id="gst-bill-gstin">27AABC17601M1ZF</span></div>
+                    <div>State: <span id="gst-bill-state">27-Maharashtra</span></div>
+                </div>
+                <div class="gst-ship-to">
+                    <div class="gst-section-label">Ship To</div>
+                    <div class="gst-customer-name-bold" id="gst-ship-name">Quess Corp Limited</div>
+                    <div id="gst-ship-address">
+                        MIDC Indus Area, Rebale, Navi Mumbai<br>
+                        Sigma IT park, TTC industrial estate,<br>
+                        Ghansoli Buhari Marg, Belapur road,sec-8<br>
+                        Thane-400701
+                    </div>
+                </div>
+                <div class="gst-invoice-details">
+                    <div class="gst-section-label">Invoice Details</div>
+                    <div class="gst-detail-item">
+                        <span class="gst-label">Invoice No.</span>
+                        <span class="gst-colon">:</span>
+                        <span id="gst-inv-no" class="gst-value">2022-2023/61</span>
+                    </div>
+                    <div class="gst-detail-item">
+                        <span class="gst-label">Date</span>
+                        <span class="gst-colon">:</span>
+                        <span id="gst-inv-date" class="gst-value">04-12-2023</span>
+                    </div>
+                    <div class="gst-detail-item">
+                        <span class="gst-label">Place of Supply</span>
+                        <span class="gst-colon">:</span>
+                        <span id="gst-inv-supply" class="gst-value">27-Maharashtra</span>
+                    </div>
+                </div>
+            </div>
+
+            <table class="gst-items-table">
+                <thead>
+                    <!-- This header is replaced dynamically in app.js based on GST Type (Local/Non-Local) -->
+                    <tr>
+                        <th width="30">#</th>
+                        <th width="350">Item name</th>
+                        <th width="100">Item Code</th>
+                        <th width="100">HSN/ SAC</th>
+                        <th width="80">Quantity</th>
+                        <th width="100">Price/ Unit</th>
+                        <th width="120">Taxable amount</th>
+                        <th width="120">IGST</th>
+                        <th width="120">Amount</th>
+                    </tr>
+                </thead>
+                <tbody id="gst-items-list">
+                    <!-- Dynamic rows -->
+                </tbody>
+            </table>
+
+            <div class="gst-tax-summary-row">
+                <div class="gst-tax-details-col">
+                    <div class="gst-tax-label">Tax details</div>
+                    <div class="gst-tax-val" id="gst-tax-percent">18%</div>
+                </div>
+                <div class="gst-amounts-col">
+                    <div class="gst-amounts-label">Amounts</div>
+                    <div class="gst-amount-row">
+                        <span>IGST</span>
+                        <span id="gst-igst-total">₹ 10,440</span>
+                    </div>
+                    <div class="gst-amount-row">
+                        <span>Sub Total</span>
+                        <span id="gst-subtotal">₹ 68,440</span>
+                    </div>
+                    <div class="gst-total-row">
+                        <span>Total</span>
+                        <span id="gst-grand-total">₹ 68,440</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="gst-payment-info-row">
+                <div class="gst-amount-words-col">
+                    <div class="gst-info-label">Invoice Amount In Words</div>
+                    <div id="gst-amount-words" class="gst-info-val">Sixty Eight Thousand Four Hundred Forty Rupees only</div>
+                    <div id="gst-payment-container">
+                        <div class="gst-info-label" style="margin-top: 10px;">Payment mode</div>
+                        <div id="gst-payment-mode" class="gst-info-val">Credit</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="gst-footer-section">
+                <div class="gst-bank-details">
+                    <div class="gst-footer-label">Bank Details</div>
+                    <div class="gst-bank-content">
+                        <div class="gst-qr-placeholder">
+                            <img id="gst-bank-qr-img" src="" alt="QR Code" style="display: none;">
+                            <i id="gst-bank-qr-icon" class="fas fa-qrcode"></i>
+                            <div style="font-size: 8px; margin-top: 2px;">SCAN TO PAY</div>
+                        </div>
+                        <div class="gst-bank-text">
+                            <div id="gst-bank-name">Name : IDBI BANK, GACHIBOWLI</div>
+                            <div id="gst-bank-acc">Account No. : 0432102000007313</div>
+                            <div id="gst-bank-ifsc">IFSC code : IBKL0000432</div>
+                            <div id="gst-bank-holder">Account holder's name : DIGITAL CONSORTIUM</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="gst-terms">
+                    <div class="gst-footer-label">Terms and Conditions</div>
+                    <div id="gst-company-terms">1.Payment : After Delivery</div>
+                </div>
+                <div class="gst-signature">
+                    <div class="gst-signature-label" id="gst-sig-label">For : DIGITAL CONSORTIUM</div>
+                    <div class="gst-signature-space">
+                        <img id="gst-sig-img" src="" alt="Signature" style="max-width: 150px; max-height: 60px; display: none;">
+                        <div id="gst-sig-mock" class="gst-sig-mock">Verry</div>
+                    </div>
+                    <div class="gst-auth-label">Authorized Signatory</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="config.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
