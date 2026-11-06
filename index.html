@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=3.3">
     <!-- Font Awesome for icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <!-- Supabase Client JS -->
@@ -22,6 +22,8 @@
     <script src="https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/dist/pouchdb.min.js"></script>
     <!-- SheetJS for Excel export -->
     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <!-- JSZip for Word .docx export -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 </head>
 <body>
     <div id="app">
@@ -102,10 +104,10 @@
                                 <select id="dash-period" onchange="handleDashboardFilterChange()">
                                     <option value="Today">Today</option>
                                     <option value="Last7Days">Last 7 Days</option>
-                                    <option value="ThisMonth" selected>This Month</option>
+                                    <option value="ThisMonth">This Month</option>
                                     <option value="LastMonth">Last Month</option>
                                     <option value="ThisYear">This Year</option>
-                                    <option value="All">All Time</option>
+                                    <option value="All" selected>All Time</option>
                                     <option value="Custom">Custom Range</option>
                                 </select>
                             </div>
@@ -191,6 +193,18 @@
                                 <h3><i class="fas fa-tasks"></i> Operational Health</h3>
                                 <div class="ops-stats">
                                     <div class="ops-stat-item">
+                                        <span>Total Products:</span>
+                                        <strong id="dash-total-products">0</strong>
+                                    </div>
+                                    <div class="ops-stat-item">
+                                        <span>Total Customers:</span>
+                                        <strong id="dash-total-customers">0</strong>
+                                    </div>
+                                    <div class="ops-stat-item">
+                                        <span>Total Suppliers:</span>
+                                        <strong id="dash-total-suppliers">0</strong>
+                                    </div>
+                                    <div class="ops-stat-item">
                                         <span>Low Stock Items:</span>
                                         <strong id="dash-low-stock" class="text-danger">0</strong>
                                     </div>
@@ -249,7 +263,7 @@
                             </div>
                         </div>
                         <div class="table-container">
-                            <table id="sales-table">
+                            <table id="sales-table" class="responsive-table">
                                 <thead>
                                     <tr>
                                         <th>Invoice #</th>
@@ -307,7 +321,7 @@
                             </div>
                         </div>
                         <div class="table-container">
-                            <table id="purchases-table">
+                            <table id="purchases-table" class="responsive-table">
                                 <thead>
                                     <tr>
                                         <th>Order #</th>
@@ -329,6 +343,12 @@
 
                     <!-- Inventory Module -->
                     <div id="inventory-view" class="module hidden">
+                        <div class="stats-grid module-stats-grid" id="inventory-stats">
+                            <div class="stat-card"><h3>Total Products</h3><p class="stat-value">0</p></div>
+                            <div class="stat-card"><h3>Total Stock</h3><p class="stat-value">0</p></div>
+                            <div class="stat-card"><h3>Inventory Value</h3><p class="stat-value">₹ 0.00</p></div>
+                            <div class="stat-card"><h3>Low Stock</h3><p class="stat-value">0</p></div>
+                        </div>
                         <div class="module-header">
                             <h2>Inventory Management</h2>
                             <div class="header-actions">
@@ -336,11 +356,14 @@
                                     <i class="fas fa-search"></i>
                                     <input type="text" id="inventory-search" placeholder="Search by Product/SKU..." oninput="handleSearch('inventory', this.value)">
                                 </div>
+                                <button class="btn-secondary" onclick="importInventoryExcel()" title="Import products from Excel"><i class="fas fa-file-import"></i> Import</button>
+                                <button class="btn-success" onclick="exportInventoryToExcel()" title="Export products to Excel"><i class="fas fa-file-excel"></i> Export to Excel</button>
                                 <button class="btn-primary" onclick="openAddItemModal()"><i class="fas fa-plus"></i> Add Product</button>
+                                <input type="file" id="inventory-excel-import" accept=".xlsx,.xls,.csv" onchange="handleInventoryExcelImport(event)" style="display: none;">
                             </div>
                         </div>
                         <div class="table-container">
-                            <table id="inventory-table">
+                            <table id="inventory-table" class="responsive-table">
                                 <thead>
                                     <tr>
                                         <th>Product Name</th>
@@ -361,6 +384,11 @@
 
                     <!-- Customers Module -->
                     <div id="customers-view" class="module hidden">
+                        <div class="stats-grid module-stats-grid" id="customers-stats">
+                            <div class="stat-card"><h3>Total Customers</h3><p class="stat-value">0</p></div>
+                            <div class="stat-card"><h3>With GST</h3><p class="stat-value">0</p></div>
+                            <div class="stat-card"><h3>Total Receivables</h3><p class="stat-value">₹ 0.00</p></div>
+                        </div>
                         <div class="module-header">
                             <h2>Customer Management</h2>
                             <div class="header-actions">
@@ -368,11 +396,14 @@
                                     <i class="fas fa-search"></i>
                                     <input type="text" id="customers-search" placeholder="Search by Name/Phone..." oninput="handleSearch('customers', this.value)">
                                 </div>
+                                <button class="btn-secondary" onclick="importCustomersExcel()" title="Import customers from Excel"><i class="fas fa-file-import"></i> Import</button>
+                                <button class="btn-success" onclick="exportCustomersToExcel()" title="Export customers to Excel"><i class="fas fa-file-excel"></i> Export to Excel</button>
                                 <button class="btn-primary" onclick="openAddCustomerModal()"><i class="fas fa-plus"></i> Add Customer</button>
+                                <input type="file" id="customers-excel-import" accept=".xlsx,.xls,.csv" onchange="handleCustomersExcelImport(event)" style="display: none;">
                             </div>
                         </div>
                         <div class="table-container">
-                            <table>
+                            <table class="responsive-table">
                                 <thead>
                                     <tr>
                                         <th>Name</th>
@@ -390,6 +421,11 @@
 
                     <!-- Suppliers Module -->
                     <div id="suppliers-view" class="module hidden">
+                        <div class="stats-grid module-stats-grid" id="suppliers-stats">
+                            <div class="stat-card"><h3>Total Suppliers</h3><p class="stat-value">0</p></div>
+                            <div class="stat-card"><h3>With GST</h3><p class="stat-value">0</p></div>
+                            <div class="stat-card"><h3>Total Payables</h3><p class="stat-value">₹ 0.00</p></div>
+                        </div>
                         <div class="module-header">
                             <h2>Supplier Management</h2>
                             <div class="header-actions">
@@ -397,11 +433,14 @@
                                     <i class="fas fa-search"></i>
                                     <input type="text" id="suppliers-search" placeholder="Search by Name/Phone..." oninput="handleSearch('suppliers', this.value)">
                                 </div>
+                                <button class="btn-secondary" onclick="importSuppliersExcel()" title="Import suppliers from Excel"><i class="fas fa-file-import"></i> Import</button>
+                                <button class="btn-success" onclick="exportSuppliersToExcel()" title="Export suppliers to Excel"><i class="fas fa-file-excel"></i> Export to Excel</button>
                                 <button class="btn-primary" onclick="openAddSupplierModal()"><i class="fas fa-plus"></i> Add Supplier</button>
+                                <input type="file" id="suppliers-excel-import" accept=".xlsx,.xls,.csv" onchange="handleSuppliersExcelImport(event)" style="display: none;">
                             </div>
                         </div>
                         <div class="table-container">
-                            <table>
+                            <table class="responsive-table">
                                 <thead>
                                     <tr>
                                         <th>Name</th>
@@ -446,17 +485,23 @@
                                     <i class="fas fa-search"></i>
                                     <input type="text" id="expenses-search" placeholder="Search Expenses..." oninput="handleSearch('expenses', this.value)">
                                 </div>
+                                <button class="btn-secondary" onclick="importExpensesExcel()" title="Import expenses from Excel"><i class="fas fa-file-import"></i> Import</button>
+                                <button class="btn-success" onclick="exportExpensesExcel()" title="Export expenses to Excel"><i class="fas fa-file-excel"></i> Export to Excel</button>
                                 <button class="btn-primary" onclick="openAddExpenseModal()"><i class="fas fa-plus"></i> Add Expense</button>
+                                <input type="file" id="expense-excel-import" accept=".xlsx,.xls,.csv" onchange="handleExpenseExcelImport(event)" style="display: none;">
                             </div>
                         </div>
                         <div class="table-container">
-                            <table>
+                            <table class="responsive-table">
                                 <thead>
                                     <tr>
                                         <th>Date</th>
                                         <th>Category</th>
                                         <th>Description</th>
-                                        <th>Amount</th>
+                                        <th>Employee Name</th>
+                                        <th>Payment Done By</th>
+                                        <th>Advance (₹)</th>
+                                        <th>Amount (₹)</th>
                                         <th>Actions</th>
                                     </tr>
                                 </thead>
@@ -557,7 +602,12 @@
                                     <div class="form-group">
                                         <label>Company Logo (PNG/JPG only)</label>
                                         <input type="file" id="prof-logo-file" accept="image/png, image/jpeg">
-                                        <img id="prof-logo-preview" src="" alt="Logo Preview" class="image-preview">
+                                        <div class="image-preview-group">
+                                            <img id="prof-logo-preview" src="" alt="Logo Preview" class="image-preview">
+                                            <button type="button" class="btn-delete-img" id="prof-logo-delete-btn" style="display: none;" onclick="deleteCompanyImage('logoUrl', 'Company Logo')">
+                                                <i class="fas fa-trash"></i> Delete Logo
+                                            </button>
+                                        </div>
                                     </div>
                                     <div class="form-group">
                                         <label>GSTIN</label>
@@ -577,6 +627,12 @@
                                         <label>Email</label>
                                         <input type="email" id="prof-email" required>
                                     </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Website URL</label>
+                                        <input type="text" id="prof-website" placeholder="e.g. https://www.yourcompany.com">
+                                    </div>
                                     <div class="form-group">
                                         <label>State</label>
                                         <input type="text" id="prof-state" required>
@@ -590,30 +646,44 @@
                                         <input type="text" id="prof-bank-name" required>
                                     </div>
                                     <div class="form-group">
-                                        <label>Account Number</label>
-                                        <input type="text" id="prof-account-no" required>
+                                        <label>Branch Address</label>
+                                        <input type="text" id="prof-branch-address" placeholder="e.g. Gachibowli, Hyderabad">
                                     </div>
                                 </div>
                                 <div class="form-row">
                                     <div class="form-group">
+                                        <label>Account Number</label>
+                                        <input type="text" id="prof-account-no" required>
+                                    </div>
+                                    <div class="form-group">
                                         <label>IFSC Code</label>
                                         <input type="text" id="prof-ifsc" required>
                                     </div>
-                                    <div class="form-group">
-                                        <label>Account Holder Name</label>
-                                        <input type="text" id="prof-holder" required>
-                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Account Holder Name</label>
+                                    <input type="text" id="prof-holder" required>
                                 </div>
                                 <div class="form-row">
                                     <div class="form-group">
                                         <label>Bank QR Code (PNG/JPG only)</label>
                                         <input type="file" id="prof-qr-file" accept="image/png, image/jpeg">
-                                        <img id="prof-qr-preview" src="" alt="QR Preview" class="image-preview qr-preview">
+                                        <div class="image-preview-group">
+                                            <img id="prof-qr-preview" src="" alt="QR Preview" class="image-preview qr-preview">
+                                            <button type="button" class="btn-delete-img" id="prof-qr-delete-btn" style="display: none;" onclick="deleteCompanyImage('qrUrl', 'Bank QR Code')">
+                                                <i class="fas fa-trash"></i> Delete QR
+                                            </button>
+                                        </div>
                                     </div>
                                     <div class="form-group">
                                         <label>Authorized Signature (PNG/JPG only)</label>
                                         <input type="file" id="prof-sig-file" accept="image/png, image/jpeg">
-                                        <img id="prof-sig-preview" src="" alt="Signature Preview" class="image-preview" style="max-height: 60px;">
+                                        <div class="image-preview-group">
+                                            <img id="prof-sig-preview" src="" alt="Signature Preview" class="image-preview" style="max-height: 60px;">
+                                            <button type="button" class="btn-delete-img" id="prof-sig-delete-btn" style="display: none;" onclick="deleteCompanyImage('sigUrl', 'Signature')">
+                                                <i class="fas fa-trash"></i> Delete Signature
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="form-group">
@@ -718,6 +788,7 @@
                     <div class="gst-company-name-header" id="gst-company-legal-name">DIGITAL CONSORTIUM</div>
                     <div id="gst-company-address">Plot 1/C | Level 6 | T Hub | Raidurgam | Hyderabad | Telangana 500081</div>
                     <div id="gst-company-contact">Phone no.: 8179232111 Email: info@dcindia.co</div>
+                    <div id="gst-company-website" style="display: none;"></div>
                     <div>GSTIN: <span id="gst-company-gstin">36AFQPC8107F2ZH</span>, State: <span id="gst-company-state">36-Telangana</span></div>
                 </div>
             </div>
@@ -735,15 +806,10 @@
                     <div>GSTIN : <span id="gst-bill-gstin">27AABC17601M1ZF</span></div>
                     <div>State: <span id="gst-bill-state">27-Maharashtra</span></div>
                 </div>
-                <div class="gst-ship-to">
+                <div class="gst-ship-to" id="gst-ship-to-section" style="display: none;">
                     <div class="gst-section-label">Ship To</div>
-                    <div class="gst-customer-name-bold" id="gst-ship-name">Quess Corp Limited</div>
-                    <div id="gst-ship-address">
-                        MIDC Indus Area, Rebale, Navi Mumbai<br>
-                        Sigma IT park, TTC industrial estate,<br>
-                        Ghansoli Buhari Marg, Belapur road,sec-8<br>
-                        Thane-400701
-                    </div>
+                    <div class="gst-customer-name-bold" id="gst-ship-name"></div>
+                    <div id="gst-ship-address"></div>
                 </div>
                 <div class="gst-invoice-details">
                     <div class="gst-section-label">Invoice Details</div>
@@ -817,27 +883,29 @@
                     </div>
                 </div>
             </div>
+            
+            <div class="gst-terms-section" id="gst-terms-section">
+                <div class="gst-info-label">Terms and Conditions</div>
+                <div id="gst-company-terms" class="gst-info-val" style="white-space: pre-wrap;">1.Payment : After Delivery</div>
+            </div>
 
             <div class="gst-footer-section">
                 <div class="gst-bank-details">
                     <div class="gst-footer-label">Bank Details</div>
                     <div class="gst-bank-content">
-                        <div class="gst-qr-placeholder">
+                        <div class="gst-qr-placeholder" id="gst-qr-section">
                             <img id="gst-bank-qr-img" src="" alt="QR Code" style="display: none;">
                             <i id="gst-bank-qr-icon" class="fas fa-qrcode"></i>
                             <div style="font-size: 8px; margin-top: 2px;">SCAN TO PAY</div>
                         </div>
                         <div class="gst-bank-text">
                             <div id="gst-bank-name">Name : IDBI BANK, GACHIBOWLI</div>
+                            <div id="gst-bank-branch" style="display: none;"></div>
                             <div id="gst-bank-acc">Account No. : 0432102000007313</div>
                             <div id="gst-bank-ifsc">IFSC code : IBKL0000432</div>
                             <div id="gst-bank-holder">Account holder's name : DIGITAL CONSORTIUM</div>
                         </div>
                     </div>
-                </div>
-                <div class="gst-terms">
-                    <div class="gst-footer-label">Terms and Conditions</div>
-                    <div id="gst-company-terms">1.Payment : After Delivery</div>
                 </div>
                 <div class="gst-signature">
                     <div class="gst-signature-label" id="gst-sig-label">For : DIGITAL CONSORTIUM</div>
@@ -851,7 +919,8 @@
         </div>
     </div>
 
-    <script src="config.js"></script>
-    <script src="app.js"></script>
+    <script src="config.js?v=2.1"></script>
+    <script src="modern-dropdown.js?v=1.1"></script>
+    <script src="app.js?v=3.3"></script>
 </body>
 </html>

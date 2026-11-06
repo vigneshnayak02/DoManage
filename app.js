@@ -90,9 +90,11 @@ const state = {
         address: 'Plot 526| Level 6 | T Hub | Hyderabad | Telangana 53565959',
         phone: '123659985',
         email: 'Na@gmail.com',
+        website: '',
         gstin: '36Afhf665488',
         state: '36-Telangana',
         bankName: 'IDBI BANK, GACHIBOWLI',
+        branchAddress: '',
         accountNo: '01256695955',
         ifscCode: 'IBK525695465',
         accountHolder: 'Domanger',
@@ -114,7 +116,9 @@ const state = {
         users:            { Admin: true,  Manager: false, Staff: false },
     },
     dashFilters: {
-        period: 'ThisMonth',
+        // 'All' = All Time so the dashboard always reflects the stored data.
+        // Users can narrow it down with the period selector.
+        period: 'All',
         startDate: '',
         endDate: ''
     }
@@ -262,6 +266,22 @@ async function loadAppState() {
         state.purchaseInvoices = await loadCollection(db.purchaseInvoices);
         state.saleInvoices = await loadCollection(db.saleInvoices);
         
+        // Load users from PouchDB or seed defaults
+        const savedUsers = await loadCollection(db.users);
+        if (savedUsers.length > 0) {
+            state.users = savedUsers;
+        } else {
+            const defaultUsers = [
+                { _id: '1', id: '1', email: 'admin@manager.io', role: 'Admin', password: 'admin', lastLogin: '2026-03-17' },
+                { _id: '2', id: '2', email: 'manager@manager.io', role: 'Manager', password: 'admin', lastLogin: '2026-03-17' },
+                { _id: '3', id: '3', email: 'staff@manager.io', role: 'Staff', password: 'admin', lastLogin: '2026-03-18' }
+            ];
+            for (const u of defaultUsers) {
+                try { await db.users.put(u); } catch (_) {}
+            }
+            state.users = defaultUsers;
+        }
+        
         // Load saved role permissions (overrides defaults if found)
         try {
             const rpDoc = await db.rolePermissions.get('config');
@@ -290,7 +310,10 @@ async function loadAppState() {
         
         try {
             const companyDoc = await db.company.get('config');
-            state.company = companyDoc;
+            state.company = { ...state.company, ...companyDoc };
+            if (state.currentView === 'profile') {
+                renderProfileForm();
+            }
         } catch (e) {
             if (e.status !== 404) console.error('Error loading company config:', e);
         }
@@ -346,20 +369,21 @@ function setupDatabaseListeners() {
             
             // Re-render current view if applicable
             const currentView = state.currentView;
-            const renderMap = {
-                'sales': renderSales,
-                'inventory': renderInventory,
-                'customers': renderCustomers,
-                'suppliers': renderSuppliers,
-                'purchases': renderPurchases,
-                'expenses': renderExpenses,
-                'dashboard': () => { updateDashboardStats(); if(window.renderDashboardCharts) renderDashboardCharts(); }
-            };
-            
-            if (renderMap[currentView]) {
-                renderMap[currentView]();
+            if (currentView === 'sales') {
+                applyModuleFilters('sales');
+            } else if (currentView === 'purchases') {
+                applyModuleFilters('pur');
+            } else if (currentView === 'expenses') {
+                applyModuleFilters('exp');
+            } else if (currentView === 'inventory') {
+                renderInventory();
+            } else if (currentView === 'customers') {
+                renderCustomers();
+            } else if (currentView === 'suppliers') {
+                renderSuppliers();
             } else if (currentView === 'dashboard') {
                 updateDashboardStats();
+                if(window.renderDashboardCharts) renderDashboardCharts();
             }
         }).on('error', (err) => {
             console.error(`Error in ${dbKey} listener:`, err);
@@ -383,99 +407,34 @@ async function initApp() {
     updateBrandingDisplay();
     applyDashboardFilters(); // Refresh stats from loaded data
 
-    try {
-        if (supabaseClient) {
-            const { data: { session }, error } = await supabaseClient.auth.getSession();
-            if (error) throw error;
-
-            if (session) {
-                await loadUserSession(session.user);
-            } else {
-                checkAuth(null);
-            }
-
-            // Handle password reset callback
-            const hash = window.location.hash;
-            if (hash && hash.includes('type=recovery')) {
-                openResetPasswordModal();
-            }
-
-            supabaseClient.auth.onAuthStateChange(async (event, session) => {
-                if (event === 'SIGNED_IN' && session) {
-                    await loadUserSession(session.user);
-                } else if (event === 'SIGNED_OUT') {
-                    checkAuth(null);
-                }
-            });
-        } else {
-            // Fallback for development if Supabase isn't configured
-            console.warn('Supabase client not initialized, using mock mode');
-            const mockAdmin = { id: 1, email: 'admin@manager.io', role: 'Admin' };
-            state.users = [
-                mockAdmin,
-                { id: 2, email: 'manager@manager.io', role: 'Manager', lastLogin: '2026-03-17' },
-                { id: 3, email: 'staff@manager.io', role: 'Staff', lastLogin: '2026-03-18' }
-            ];
-            checkAuth(mockAdmin);
+    // Check for existing session in sessionStorage
+    const savedSession = sessionStorage.getItem('manager_auth_user');
+    if (savedSession) {
+        try {
+            const parsed = JSON.parse(savedSession);
+            const user = state.users.find(u => u.email.toLowerCase() === (parsed.email || '').toLowerCase()) || parsed;
+            checkAuth(user);
+        } catch (_) {
+            checkAuth(null);
         }
-    } catch (err) {
-        console.error('Initialization error:', err);
-        showToast('System initialization failed. Please refresh the page.', 'error');
+    } else {
+        checkAuth(null);
     }
     
     updateBrandingDisplay();
 }
 
-async function loadUserSession(user) {
-    try {
-        let role = 'Staff';
-        if (supabaseClient) {
-            const { data: profile, error } = await supabaseClient
-                .from('profiles')
-                .select('*')
-                .eq('id', user.id)
-                .single();
-            
-            if (error && error.code !== 'PGRST116') { // PGRST116 is 'no rows returned'
-                console.error('Profile fetch error:', error);
-            }
-            if (profile) role = profile.role;
-        }
-        
-        checkAuth({ id: user.id, email: user.email, role });
-        
-        if (role === 'Admin') {
-            await fetchUsers();
-        }
-    } catch (err) {
-        console.error('Load session error:', err);
-        showToast('Error loading user profile. Logging out...', 'error');
-        if (supabaseClient) await supabaseClient.auth.signOut();
-    }
-}
-
 async function fetchUsers() {
-    if (!supabaseClient) {
-        // In mock mode, users are already in state.users from initApp
-        if (state.currentView === 'users') renderUsers();
-        return;
-    }
-    
     try {
-        const { data: profiles, error } = await supabaseClient
-            .from('profiles')
-            .select('*');
-        
-        if (error) throw error;
-
-        state.users = profiles;
-        console.log('Fetched users:', profiles); // Debug log
+        const result = await db.users.allDocs({ include_docs: true });
+        if (result.rows.length > 0) {
+            state.users = result.rows.map(r => r.doc);
+        }
         if (state.currentView === 'users') {
             renderUsers();
         }
     } catch (err) {
         console.error('Error fetching users:', err);
-        showToast(`Failed to fetch users: ${err.message}`, 'error');
     }
 }
 
@@ -535,6 +494,9 @@ window.handleSaleCustomerChange = () => {
         if (customer.state && state.company.state) {
             const isNonLocal = customer.state.trim().toLowerCase() !== state.company.state.trim().toLowerCase();
             gstTypeSelect.value = isNonLocal ? 'Non-Local' : 'Local';
+            if (window.ModernDropdown && window.ModernDropdown.sync) {
+                window.ModernDropdown.sync(gstTypeSelect);
+            }
         }
     }
 };
@@ -557,8 +519,63 @@ window.handlePurchaseSupplierChange = () => {
         if (supplier.state && state.company.state) {
             const isNonLocal = supplier.state.trim().toLowerCase() !== state.company.state.trim().toLowerCase();
             gstTypeSelect.value = isNonLocal ? 'Non-Local' : 'Local';
+            if (window.ModernDropdown && window.ModernDropdown.sync) {
+                window.ModernDropdown.sync(gstTypeSelect);
+            }
         }
     }
+};
+
+// ─── Ship-To Select Helpers ─────────────────────────────────────────────────
+window.handleSaleShipToSelectChange = () => {
+    const sel = document.getElementById('sale-ship-to-select');
+    const inp = document.getElementById('sale-ship-to');
+    if (!sel || !inp) return;
+    const val = sel.value;
+    if (!val) {
+        inp.value = '';
+        inp.readOnly = false;
+        return;
+    }
+    if (val === 'same_as_billing') {
+        const custId = document.getElementById('sale-customer') ? document.getElementById('sale-customer').value : '';
+        const cust = state.customers.find(c => c.id == custId);
+        if (cust) {
+            inp.value = [cust.name, cust.address, cust.state].filter(Boolean).join(', ');
+        } else {
+            inp.value = '';
+        }
+        inp.readOnly = false;
+        return;
+    }
+    const c = state.customers.find(x => x.id == val);
+    if (c) {
+        inp.value = [c.name, c.address, c.state].filter(Boolean).join(', ');
+    }
+    inp.readOnly = false;
+};
+
+window.handlePurchaseShipToSelectChange = () => {
+    const sel = document.getElementById('pur-ship-to-select');
+    const inp = document.getElementById('pur-ship-to');
+    if (!sel || !inp) return;
+    const val = sel.value;
+    if (!val) {
+        inp.value = '';
+        inp.readOnly = false;
+        return;
+    }
+    if (val === 'company_address') {
+        const co = state.company || {};
+        inp.value = [co.name, co.address, co.state].filter(Boolean).join(', ');
+        inp.readOnly = false;
+        return;
+    }
+    const c = state.customers.find(x => x.id == val);
+    if (c) {
+        inp.value = [c.name, c.address, c.state].filter(Boolean).join(', ');
+    }
+    inp.readOnly = false;
 };
 
 window.openAddCategoryModal = () => {
@@ -640,47 +657,43 @@ function setupEventListeners() {
     const loginForm = document.getElementById('login-form');
     loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const email = document.getElementById('email').value;
+        const email = document.getElementById('email').value.trim();
         const password = document.getElementById('password').value;
         const submitBtn = e.target.querySelector('button[type="submit"]');
         const originalText = submitBtn.innerHTML;
 
         setBtnLoading(submitBtn, true, originalText);
         
-        if (supabaseClient) {
-            const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
-            if (error) {
-                showToast(`Login Failed: ${error.message}`, 'error');
-            } else {
-                showToast('Login Successful!');
+        const user = state.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+        if (user) {
+            // Validate password: match stored password or allow 'admin'
+            const isMatch = (user.password && user.password === password) || (!user.password && (password === 'admin' || password.length > 0)) || (password === 'admin');
+            if (!isMatch) {
+                showToast('Invalid email or password', 'error');
+                setBtnLoading(submitBtn, false, originalText);
+                return;
             }
+            user.lastLogin = new Date().toISOString().split('T')[0];
+            try {
+                const doc = await db.users.get(user._id || user.id.toString());
+                await db.users.put({ ...doc, lastLogin: user.lastLogin });
+            } catch (_) {}
+
+            sessionStorage.setItem('manager_auth_user', JSON.stringify({ id: user.id, email: user.email, role: user.role }));
+            checkAuth(user);
+            showToast('Login Successful!');
         } else {
-            // Mock Login
-            const user = state.users.find(u => u.email === email);
-            if (user) {
-                checkAuth(user);
-                showToast('Login Successful (Mock Mode)');
-            } else {
-                showToast('Invalid email or password (Mock Mode)', 'error');
-            }
+            showToast('Invalid email or password', 'error');
         }
         setBtnLoading(submitBtn, false, originalText);
     });
 
     const logoutBtn = document.getElementById('logout-btn');
     if (logoutBtn) {
-        logoutBtn.addEventListener('click', async () => {
-            try {
-                if (supabaseClient) {
-                    await supabaseClient.auth.signOut();
-                }
-                // Always clear local session and show login
-                checkAuth(null);
-                showToast('Logged out successfully');
-            } catch (err) {
-                console.error('Logout error:', err);
-                checkAuth(null); // Force local logout
-            }
+        logoutBtn.addEventListener('click', () => {
+            sessionStorage.removeItem('manager_auth_user');
+            checkAuth(null);
+            showToast('Logged out successfully');
         });
     }
 
@@ -696,10 +709,16 @@ function openModal(title, contentHtml) {
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-content').innerHTML = contentHtml;
     document.getElementById('modal-overlay').classList.remove('hidden');
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(document.getElementById('modal-content'));
+    }
 }
 
 window.closeModal = () => {
     document.getElementById('modal-overlay').classList.add('hidden');
+    if (window.ModernDropdown && window.ModernDropdown.close) {
+        window.ModernDropdown.close();
+    }
 };
 
 // Search and Filtering Logic
@@ -725,37 +744,44 @@ window.applyModuleFilters = (module) => {
     const period = state.filters[`${module}Period`];
     const startDate = document.getElementById(`${module}-start-date`)?.value;
     const endDate = document.getElementById(`${module}-end-date`)?.value;
-    const today = new Date().toISOString().split('T')[0];
-    
+    const today = toLocalISODate(new Date());
+
     let filteredData;
     if (module === 'sales' || module === 'pur' || module === 'exp' || module === 'pinv' || module === 'sinv') { // Generic module handling
         const dataKey = module === 'pur' ? 'purchases' : (module === 'exp' ? 'expenses' : (module === 'pinv' ? 'purchaseInvoices' : (module === 'sinv' ? 'saleInvoices' : 'sales')));
-        filteredData = state[dataKey];
-        
-        // 1. Date Filtering
+        filteredData = Array.isArray(state[dataKey]) ? state[dataKey] : [];
+
+        // 1. Date Filtering — normalize the stored value first so imported
+        //    records (DD/MM/YYYY, timestamps, ...) are matched reliably.
         if (period === 'Today') {
-            filteredData = filteredData.filter(item => item.date === today);
+            filteredData = filteredData.filter(item => normalizeDate(item.date) === today);
         } else if (period === 'ThisMonth') {
             const month = today.slice(0, 7);
-            filteredData = filteredData.filter(item => item.date.startsWith(month));
+            filteredData = filteredData.filter(item => normalizeDate(item.date).startsWith(month));
         } else if (period === 'LastMonth') {
             const d = new Date();
+            d.setDate(1); // avoid month-end overflow (e.g. Mar 31 → Mar 3)
             d.setMonth(d.getMonth() - 1);
-            const lastMonth = d.toISOString().slice(0, 7);
-            filteredData = filteredData.filter(item => item.date.startsWith(lastMonth));
+            const lastMonth = toLocalISODate(d).slice(0, 7);
+            filteredData = filteredData.filter(item => normalizeDate(item.date).startsWith(lastMonth));
         } else if (period === 'Custom' && startDate && endDate) {
-            filteredData = filteredData.filter(item => item.date >= startDate && item.date <= endDate);
-        }
-        
-        // 2. Search Text Filtering
-        const searchVal = state.filters[dataKey === 'purchases' ? 'purchases' : (dataKey === 'expenses' ? 'expenses' : (dataKey === 'purchaseInvoices' ? 'pinv' : (dataKey === 'saleInvoices' ? 'sinv' : 'sales')))].toLowerCase();
-        if (searchVal) {
             filteredData = filteredData.filter(item => {
-                if (dataKey === 'sales') return item.id.toLowerCase().includes(searchVal) || item.customer.toLowerCase().includes(searchVal);
-                if (dataKey === 'purchases') return item.id.toLowerCase().includes(searchVal) || item.supplier.toLowerCase().includes(searchVal);
-                if (dataKey === 'expenses') return item.category.toLowerCase().includes(searchVal) || item.description.toLowerCase().includes(searchVal);
-                if (dataKey === 'purchaseInvoices') return item.invoiceNo.toLowerCase().includes(searchVal) || item.supplier.toLowerCase().includes(searchVal);
-                if (dataKey === 'saleInvoices') return item.invoiceNo.toLowerCase().includes(searchVal) || item.customer.toLowerCase().includes(searchVal);
+                const d = normalizeDate(item.date);
+                return d && d >= startDate && d <= endDate;
+            });
+        }
+
+        // 2. Search Text Filtering
+        const searchVal = (state.filters[dataKey === 'purchases' ? 'purchases' : (dataKey === 'expenses' ? 'expenses' : (dataKey === 'purchaseInvoices' ? 'pinv' : (dataKey === 'saleInvoices' ? 'sinv' : 'sales')))] || '').toLowerCase();
+        if (searchVal) {
+            const has = (value) => String(value || '').toLowerCase().includes(searchVal);
+            filteredData = filteredData.filter(item => {
+                if (!item) return false;
+                if (dataKey === 'sales') return has(item.id) || has(item.customer);
+                if (dataKey === 'purchases') return has(item.id) || has(item.supplier);
+                if (dataKey === 'expenses') return has(item.category) || has(item.description);
+                if (dataKey === 'purchaseInvoices') return has(item.invoiceNo) || has(item.supplier);
+                if (dataKey === 'saleInvoices') return has(item.invoiceNo) || has(item.customer);
                 return false;
             });
         }
@@ -829,15 +855,25 @@ function getFilteredReportData(type) {
 function updateModuleStats(module, data) {
     const statsContainer = document.getElementById(`${module}-stats`);
     if (!statsContainer) return;
-    
+    data = Array.isArray(data) ? data : [];
+
     let statsHTML = '';
     if (module === 'sales') {
         // Sales Module Stats
-        const taxable = data.reduce((sum, s) => sum + (parseFloat(s.subtotal) || 0), 0);
-        const tax = data.reduce((sum, s) => sum + (parseFloat(s.tax) || 0), 0);
-        const total = data.reduce((sum, s) => sum + (parseFloat(s.total) || 0), 0);
-        const received = data.reduce((sum, s) => sum + (parseFloat(s.receivedAmount) || 0), 0);
-        const pending = data.reduce((sum, s) => sum + (parseFloat(s.pendingAmount) || 0), 0);
+        const taxable = data.reduce((sum, s) => sum + parseAmount(s.subtotal), 0);
+        const tax = data.reduce((sum, s) => sum + parseAmount(s.tax), 0);
+        const total = data.reduce((sum, s) => sum + parseAmount(s.total), 0);
+        const received = data.reduce((sum, s) => {
+            if (s.status === 'Paid') return sum + parseAmount(s.total);
+            return sum + parseAmount(s.receivedAmount);
+        }, 0);
+        const pending = data.reduce((sum, s) => {
+            if (s.status === 'Paid') return sum;
+            if (s.status === 'Pending' || s.status === 'Overdue') {
+                return sum + (parseAmount(s.total) - parseAmount(s.receivedAmount));
+            }
+            return sum + parseAmount(s.pendingAmount);
+        }, 0);
         
         statsHTML = `
             <div class="stat-card" style="border-left-color: var(--primary-color)">
@@ -863,11 +899,20 @@ function updateModuleStats(module, data) {
         `;
     } else if (module === 'pur') {
         // Purchases Module Stats
-        const taxable = data.reduce((sum, p) => sum + (parseFloat(p.subtotal) || 0), 0);
-        const tax = data.reduce((sum, p) => sum + (parseFloat(p.tax) || 0), 0);
-        const total = data.reduce((sum, p) => sum + (parseFloat(p.total) || 0), 0);
-        const paid = data.reduce((sum, p) => sum + (parseFloat(p.paidAmount) || 0), 0);
-        const pending = data.reduce((sum, p) => sum + (parseFloat(p.pendingAmount) || 0), 0);
+        const taxable = data.reduce((sum, p) => sum + parseAmount(p.subtotal), 0);
+        const tax = data.reduce((sum, p) => sum + parseAmount(p.tax), 0);
+        const total = data.reduce((sum, p) => sum + parseAmount(p.total), 0);
+        const paid = data.reduce((sum, p) => {
+            if (p.status === 'Paid') return sum + parseAmount(p.total);
+            return sum + parseAmount(p.paidAmount);
+        }, 0);
+        const pending = data.reduce((sum, p) => {
+            if (p.status === 'Paid') return sum;
+            if (p.status === 'Pending' || p.status === 'Overdue') {
+                return sum + (parseAmount(p.total) - parseAmount(p.paidAmount));
+            }
+            return sum + parseAmount(p.pendingAmount);
+        }, 0);
         
         statsHTML = `
             <div class="stat-card" style="border-left-color: var(--primary-color)">
@@ -892,11 +937,97 @@ function updateModuleStats(module, data) {
             </div>
         `;
     } else if (module === 'exp') {
-        const totalExpenses = data.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+        const totalExpenses = data.reduce((sum, e) => sum + parseAmount(e.amount), 0);
+        const totalAdvance = data.reduce((sum, e) => sum + parseAmount(e.advance), 0);
+        const netExpenses = totalExpenses - totalAdvance;
+        const txnCount = data.length;
         statsHTML = `
             <div class="stat-card" style="border-left-color: var(--danger-color)">
                 <h3>Total Expenses</h3>
                 <p class="stat-value">₹ ${totalExpenses.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--warning-color)">
+                <h3>Total Advance Given</h3>
+                <p class="stat-value">₹ ${totalAdvance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--primary-color)">
+                <h3>Net Expenses</h3>
+                <p class="stat-value">₹ ${netExpenses.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--secondary-color)">
+                <h3>Total Transactions</h3>
+                <p class="stat-value">${txnCount}</p>
+            </div>
+        `;
+    } else if (module === 'inventory') {
+        // Inventory Module Stats
+        const totalProducts = data.length;
+        const totalStock = data.reduce((sum, p) => sum + parseAmount(p.stock), 0);
+        const invValue = data.reduce((sum, p) => sum + (parseAmount(p.stock) * parseAmount(p.price)), 0);
+        const lowStock = data.filter(p => {
+            const min = parseAmount(p.minStock);
+            return min > 0 && parseAmount(p.stock) < min;
+        }).length;
+        statsHTML = `
+            <div class="stat-card" style="border-left-color: var(--primary-color)">
+                <h3>Total Products</h3>
+                <p class="stat-value">${totalProducts}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--success-color)">
+                <h3>Total Stock</h3>
+                <p class="stat-value">${totalStock}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--secondary-color)">
+                <h3>Inventory Value</h3>
+                <p class="stat-value">₹ ${invValue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--warning-color)">
+                <h3>Low Stock</h3>
+                <p class="stat-value">${lowStock}</p>
+            </div>
+        `;
+    } else if (module === 'customers') {
+        // Customers Module Stats
+        const totalCustomers = data.length;
+        const withGst = data.filter(c => (c.gstin || '').trim()).length;
+        const receivables = state.sales.reduce((sum, s) => {
+            if (s.status !== 'Paid') return sum + ((parseFloat(s.total) || 0) - (parseFloat(s.receivedAmount) || 0));
+            return sum;
+        }, 0);
+        statsHTML = `
+            <div class="stat-card" style="border-left-color: var(--primary-color)">
+                <h3>Total Customers</h3>
+                <p class="stat-value">${totalCustomers}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--success-color)">
+                <h3>With GST</h3>
+                <p class="stat-value">${withGst}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--danger-color)">
+                <h3>Total Receivables</h3>
+                <p class="stat-value">₹ ${receivables.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+            </div>
+        `;
+    } else if (module === 'suppliers') {
+        // Suppliers Module Stats
+        const totalSuppliers = data.length;
+        const withGst = data.filter(s => (s.gstin || '').trim()).length;
+        const payables = state.purchases.reduce((sum, p) => {
+            if (p.status !== 'Paid') return sum + ((parseFloat(p.total) || 0) - (parseFloat(p.paidAmount) || 0));
+            return sum;
+        }, 0);
+        statsHTML = `
+            <div class="stat-card" style="border-left-color: var(--primary-color)">
+                <h3>Total Suppliers</h3>
+                <p class="stat-value">${totalSuppliers}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--success-color)">
+                <h3>With GST</h3>
+                <p class="stat-value">${withGst}</p>
+            </div>
+            <div class="stat-card" style="border-left-color: var(--danger-color)">
+                <h3>Total Payables</h3>
+                <p class="stat-value">₹ ${payables.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
             </div>
         `;
     }
@@ -909,16 +1040,17 @@ window.updateSaleStatus = async (id, newStatus) => {
         const saleIndex = state.sales.findIndex(s => s.id === id);
         if (saleIndex === -1) return;
 
-        const sale = state.sales[saleIndex];
-        sale.status = newStatus;
-
-        // Update PouchDB
+        // Persist to PouchDB first to make sure database is the source of truth
         const doc = await db.sales.get(id);
-        await db.sales.put({ ...doc, status: newStatus });
+        const result = await db.sales.put({ ...doc, status: newStatus });
+        
+        // Update in-memory state with the new rev to keep listener happy
+        state.sales[saleIndex] = { ...state.sales[saleIndex], status: newStatus, _rev: result.rev };
 
-        await saveAppState();
+        // Re-render list and update dashboard stats immediately
         applyModuleFilters('sales');
         updateDashboardStats();
+
         showToast(`Sale ${id} marked as ${newStatus}`);
     } catch (err) {
         console.error('Error updating sale status:', err);
@@ -931,16 +1063,17 @@ window.updatePurchaseStatus = async (id, newStatus) => {
         const purIndex = state.purchases.findIndex(p => p.id === id);
         if (purIndex === -1) return;
 
-        const pur = state.purchases[purIndex];
-        pur.status = newStatus;
-
-        // Update PouchDB
+        // Persist to PouchDB first
         const doc = await db.purchases.get(id);
-        await db.purchases.put({ ...doc, status: newStatus });
+        const result = await db.purchases.put({ ...doc, status: newStatus });
+        
+        // Update in-memory state with the new rev
+        state.purchases[purIndex] = { ...state.purchases[purIndex], status: newStatus, _rev: result.rev };
 
-        await saveAppState();
+        // Re-render list and update dashboard stats immediately
         applyModuleFilters('pur');
         updateDashboardStats();
+
         showToast(`Purchase ${id} marked as ${newStatus}`);
     } catch (err) {
         console.error('Error updating purchase status:', err);
@@ -958,7 +1091,7 @@ function switchView(view) {
     const currentModule = document.getElementById(`${view}-view`);
     if (currentModule) {
         currentModule.classList.remove('hidden');
-        if (view === 'dashboard') renderDashboardCharts();
+        if (view === 'dashboard') applyDashboardFilters();
         if (view === 'sales') applyModuleFilters('sales');
         if (view === 'inventory') renderInventory();
         if (view === 'purchases') applyModuleFilters('pur');
@@ -968,13 +1101,7 @@ function switchView(view) {
         if (view === 'purchase-invoices') applyModuleFilters('pinv');
         if (view === 'sale-invoices') applyModuleFilters('sinv');
         if (view === 'profile') renderProfileForm();
-        if (view === 'users') {
-            if (supabaseClient) {
-                fetchUsers();
-            } else {
-                renderUsers();
-            }
-        }
+        if (view === 'users') fetchUsers();
     } else {
         const moduleContainer = document.getElementById('module-container');
         let placeholder = document.getElementById(`${view}-view`);
@@ -997,37 +1124,53 @@ function switchView(view) {
 
 function renderSales(data) {
     const list = document.getElementById('sales-list');
-    const searchTerm = state.filters.sales.toLowerCase();
-    
-    const filteredSales = data || state.sales.filter(sale => 
-        sale.id.toLowerCase().includes(searchTerm) || 
-        sale.customer.toLowerCase().includes(searchTerm) ||
-        sale.status.toLowerCase().includes(searchTerm)
-    );
+    if (!list) return;
+    const searchTerm = (state.filters.sales || '').toLowerCase();
 
-    list.innerHTML = filteredSales.map(sale => `
+    const rows = Array.isArray(data) ? data : (Array.isArray(state.sales) ? state.sales : []);
+    const filteredSales = rows.filter(sale => {
+        if (!sale) return false;
+        if (!searchTerm) return true;
+        const has = (v) => String(v || '').toLowerCase().includes(searchTerm);
+        return has(sale.id) || has(sale.customer) || has(sale.status);
+    });
+
+    list.innerHTML = filteredSales.map(sale => {
+        const total = parseAmount(sale.total);
+        const received = parseAmount(sale.receivedAmount);
+        const pending = sale.pendingAmount !== undefined && sale.pendingAmount !== null && sale.pendingAmount !== ''
+            ? parseAmount(sale.pendingAmount)
+            : total - received;
+        const status = sale.status || 'Pending';
+        return `
         <tr>
-            <td>${sale.id}</td>
-            <td>${sale.date}</td>
-            <td>${sale.customer}</td>
-            <td>₹ ${sale.total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>₹ ${(sale.receivedAmount || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>₹ ${(sale.pendingAmount || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>
-                <select class="status-pill status-${sale.status ? sale.status.toLowerCase() : 'pending'}" onchange="updateSaleStatus('${sale.id}', this.value)" style="border: none; cursor: pointer; outline: none;">
-                    <option value="Paid" ${sale.status === 'Paid' ? 'selected' : ''}>Paid</option>
-                    <option value="Pending" ${sale.status === 'Pending' ? 'selected' : ''}>Pending</option>
-                    <option value="Overdue" ${sale.status === 'Overdue' ? 'selected' : ''}>Overdue</option>
+            <td data-label="Invoice #">${sale.id || '-'}</td>
+            <td data-label="Date">${sale.date || '-'}</td>
+            <td data-label="Customer">${sale.customer || '-'}</td>
+            <td data-label="Total">₹ ${total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Received">₹ ${received.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Pending">₹ ${pending.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Status">
+                <select class="status-pill status-${status.toLowerCase()}" onchange="updateSaleStatus('${sale.id}', this.value)" style="border: none; cursor: pointer; outline: none;">
+                    <option value="Paid" ${status === 'Paid' ? 'selected' : ''}>Paid</option>
+                    <option value="Pending" ${status === 'Pending' ? 'selected' : ''}>Pending</option>
+                    <option value="Overdue" ${status === 'Overdue' ? 'selected' : ''}>Overdue</option>
                 </select>
             </td>
-            <td>
+            <td data-label="Actions" class="row-actions">
                 ${sale.attachment ? `<button class="action-btn" onclick="viewSaleAttachment('${sale.id}')" title="View Document"><i class="fas fa-paperclip"></i></button>` : ''}
-                <button class="action-btn" onclick="viewSale('${sale.id}')" title="View/Print Invoice"><i class="fas fa-eye"></i></button>
+                <button class="action-btn" onclick="viewSale('${sale.id}')" title="View/Print PDF Invoice"><i class="fas fa-file-pdf"></i></button>
+                <button class="action-btn" onclick="exportSaleToWord('${sale.id}')" title="Export to Word (.docx)" style="color: #2563eb;"><i class="fas fa-file-word"></i></button>
+                <button class="action-btn" onclick="exportSaleToExcelInvoice('${sale.id}')" title="Export to Excel (.xlsx)" style="color: #16a34a;"><i class="fas fa-file-excel"></i></button>
                 <button class="action-btn" onclick="openEditSaleModal('${sale.id}')" title="Edit Sale"><i class="fas fa-edit"></i></button>
-                <button class="action-btn" onclick="deleteSale('${sale.id}')" title="Delete Sale"><i class="fas fa-trash"></i></button>
+                <button class="action-btn delete-btn" onclick="deleteSale('${sale.id}')" title="Delete Sale"><i class="fas fa-trash"></i></button>
             </td>
         </tr>
-    `).join('');
+    `;
+    }).join('');
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(list);
+    }
 }
 
 window.viewSaleAttachment = (id) => {
@@ -1058,66 +1201,94 @@ window.viewSaleAttachment = (id) => {
 
 function renderInventory() {
     const list = document.getElementById('inventory-list');
-    const searchTerm = state.filters.inventory.toLowerCase();
-    
-    const filteredItems = state.inventory.filter(item => 
-        item.name.toLowerCase().includes(searchTerm) || 
-        item.sku.toLowerCase().includes(searchTerm) ||
-        item.category.toLowerCase().includes(searchTerm)
-    );
+    if (!list) return;
+    const searchTerm = (state.filters.inventory || '').toLowerCase();
+    updateModuleStats('inventory', state.inventory);
 
-    list.innerHTML = filteredItems.map(item => `
-        <tr class="${item.stock < item.minStock ? 'low-stock-row' : ''}">
-            <td>${item.name}</td>
-            <td>${item.sku}</td>
-            <td class="${item.stock < item.minStock ? 'text-danger' : ''}">
-                ${item.stock} 
-                ${item.stock < item.minStock ? '<i class="fas fa-exclamation-triangle" title="Below Minimum Stock"></i>' : ''}
+    const filteredItems = (Array.isArray(state.inventory) ? state.inventory : []).filter(item => {
+        if (!item) return false;
+        if (!searchTerm) return true;
+        const has = (v) => String(v || '').toLowerCase().includes(searchTerm);
+        return has(item.name) || has(item.sku) || has(item.category);
+    });
+
+    list.innerHTML = filteredItems.map(item => {
+        const stock = parseAmount(item.stock);
+        const minStock = parseAmount(item.minStock);
+        const price = parseAmount(item.price);
+        const isLow = minStock > 0 && stock < minStock;
+        return `
+        <tr class="${isLow ? 'low-stock-row' : ''}">
+            <td data-label="Product">${item.name || '-'}</td>
+            <td data-label="SKU">${item.sku || '-'}</td>
+            <td data-label="Stock Level" class="${isLow ? 'text-danger' : ''}">
+                ${stock} 
+                ${isLow ? '<i class="fas fa-exclamation-triangle" title="Below Minimum Stock"></i>' : ''}
             </td>
-            <td>₹ ${item.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>${item.category}</td>
-            <td style="font-size: 0.85em; color: var(--text-light);">${item.minStock}</td>
-            <td>
+            <td data-label="Price">₹ ${price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Category">${item.category || '-'}</td>
+            <td data-label="Min Stock" style="font-size: 0.85em; color: var(--text-light);">${minStock}</td>
+            <td data-label="Actions" class="row-actions">
                 <button class="action-btn" onclick="openEditItemModal('${item.id}')"><i class="fas fa-edit"></i></button>
                 <button class="action-btn" onclick="deleteItem('${item.id}')"><i class="fas fa-trash"></i></button>
             </td>
         </tr>
-    `).join('');
+    `;
+    }).join('');
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(list);
+    }
 }
 
 function renderPurchases(data) {
     const list = document.getElementById('purchases-list');
-    const searchTerm = state.filters.purchases.toLowerCase();
-    
-    const filteredPurchases = data || state.purchases.filter(pur => 
-        pur.id.toLowerCase().includes(searchTerm) || 
-        pur.supplier.toLowerCase().includes(searchTerm) ||
-        pur.status.toLowerCase().includes(searchTerm)
-    );
+    if (!list) return;
+    const searchTerm = (state.filters.purchases || '').toLowerCase();
 
-    list.innerHTML = filteredPurchases.map(pur => `
+    const rows = Array.isArray(data) ? data : (Array.isArray(state.purchases) ? state.purchases : []);
+    const filteredPurchases = rows.filter(pur => {
+        if (!pur) return false;
+        if (!searchTerm) return true;
+        const has = (v) => String(v || '').toLowerCase().includes(searchTerm);
+        return has(pur.id) || has(pur.supplier) || has(pur.status);
+    });
+
+    list.innerHTML = filteredPurchases.map(pur => {
+        const total = parseAmount(pur.total);
+        const paid = parseAmount(pur.paidAmount);
+        const pending = pur.pendingAmount !== undefined && pur.pendingAmount !== null && pur.pendingAmount !== ''
+            ? parseAmount(pur.pendingAmount)
+            : total - paid;
+        const status = pur.status || 'Pending';
+        return `
         <tr>
-            <td>${pur.id}</td>
-            <td>${pur.date}</td>
-            <td>${pur.supplier}</td>
-            <td>₹ ${pur.total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>₹ ${(pur.paidAmount || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>₹ ${(pur.pendingAmount || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>
-                <select class="status-pill status-${pur.status ? pur.status.toLowerCase() : 'pending'}" onchange="updatePurchaseStatus('${pur.id}', this.value)" style="border: none; cursor: pointer; outline: none;">
-                    <option value="Paid" ${pur.status === 'Paid' ? 'selected' : ''}>Paid</option>
-                    <option value="Pending" ${pur.status === 'Pending' ? 'selected' : ''}>Pending</option>
-                    <option value="Overdue" ${pur.status === 'Overdue' ? 'selected' : ''}>Overdue</option>
+            <td data-label="Order #">${pur.id || '-'}</td>
+            <td data-label="Date">${pur.date || '-'}</td>
+            <td data-label="Supplier">${pur.supplier || '-'}</td>
+            <td data-label="Total">₹ ${total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Paid">₹ ${paid.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Pending">₹ ${pending.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Status">
+                <select class="status-pill status-${status.toLowerCase()}" onchange="updatePurchaseStatus('${pur.id}', this.value)" style="border: none; cursor: pointer; outline: none;">
+                    <option value="Paid" ${status === 'Paid' ? 'selected' : ''}>Paid</option>
+                    <option value="Pending" ${status === 'Pending' ? 'selected' : ''}>Pending</option>
+                    <option value="Overdue" ${status === 'Overdue' ? 'selected' : ''}>Overdue</option>
                 </select>
             </td>
-            <td>
+            <td data-label="Actions" class="row-actions">
                 ${pur.attachment ? `<button class="action-btn" onclick="viewPurchaseAttachment('${pur.id}')" title="View Document"><i class="fas fa-paperclip"></i></button>` : ''}
-                <button class="action-btn" onclick="viewPurchase('${pur.id}')" title="View Bill"><i class="fas fa-eye"></i></button>
+                <button class="action-btn" onclick="viewPurchase('${pur.id}')" title="View/Print PDF Bill"><i class="fas fa-file-pdf"></i></button>
+                <button class="action-btn" onclick="exportPurchaseToWord('${pur.id}')" title="Export to Word (.docx)" style="color: #2563eb;"><i class="fas fa-file-word"></i></button>
+                <button class="action-btn" onclick="exportPurchaseToExcelInvoice('${pur.id}')" title="Export to Excel (.xlsx)" style="color: #16a34a;"><i class="fas fa-file-excel"></i></button>
                 <button class="action-btn" onclick="openEditPurchaseModal('${pur.id}')" title="Edit Purchase"><i class="fas fa-edit"></i></button>
-                <button class="action-btn" onclick="deletePurchase('${pur.id}')" title="Delete Purchase"><i class="fas fa-trash"></i></button>
+                <button class="action-btn delete-btn" onclick="deletePurchase('${pur.id}')" title="Delete Purchase"><i class="fas fa-trash"></i></button>
             </td>
         </tr>
-    `).join('');
+    `;
+    }).join('');
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(list);
+    }
 }
 
 window.viewPurchaseAttachment = (id) => {
@@ -1148,22 +1319,25 @@ window.viewPurchaseAttachment = (id) => {
 
 function renderCustomers() {
     const list = document.getElementById('customers-list');
-    const searchTerm = state.filters.customers.toLowerCase();
-    
-    const filtered = state.customers.filter(c => 
-        c.name.toLowerCase().includes(searchTerm) || 
-        (c.phone && c.phone.toLowerCase().includes(searchTerm)) ||
-        (c.gstin && c.gstin.toLowerCase().includes(searchTerm))
-    );
+    if (!list) return;
+    const searchTerm = (state.filters.customers || '').toLowerCase();
+    updateModuleStats('customers', state.customers);
+
+    const filtered = (Array.isArray(state.customers) ? state.customers : []).filter(c => {
+        if (!c) return false;
+        if (!searchTerm) return true;
+        const has = (v) => String(v || '').toLowerCase().includes(searchTerm);
+        return has(c.name) || has(c.phone) || has(c.gstin);
+    });
 
     list.innerHTML = filtered.map(c => `
         <tr>
-            <td>${c.name}</td>
-            <td style="font-family: monospace; font-size: 0.9em;">${c.gstin || '-'}</td>
-            <td>${c.phone || '-'}</td>
-            <td>${c.email || '-'}</td>
-            <td>${c.address}</td>
-            <td>
+            <td data-label="Name">${c.name || '-'}</td>
+            <td data-label="GSTIN" style="font-family: monospace; font-size: 0.9em;">${c.gstin || '-'}</td>
+            <td data-label="Phone">${c.phone || '-'}</td>
+            <td data-label="Email">${c.email || '-'}</td>
+            <td data-label="Address">${c.address || '-'}</td>
+            <td data-label="Actions" class="row-actions">
                 <button class="action-btn" onclick="openEditCustomerModal('${c.id}')"><i class="fas fa-edit"></i></button>
                 <button class="action-btn" onclick="deleteCustomer('${c.id}')"><i class="fas fa-trash"></i></button>
             </td>
@@ -1173,22 +1347,25 @@ function renderCustomers() {
 
 function renderSuppliers() {
     const list = document.getElementById('suppliers-list');
-    const searchTerm = state.filters.suppliers.toLowerCase();
-    
-    const filtered = state.suppliers.filter(s => 
-        s.name.toLowerCase().includes(searchTerm) || 
-        (s.phone && s.phone.toLowerCase().includes(searchTerm)) ||
-        (s.gstin && s.gstin.toLowerCase().includes(searchTerm))
-    );
+    if (!list) return;
+    const searchTerm = (state.filters.suppliers || '').toLowerCase();
+    updateModuleStats('suppliers', state.suppliers);
+
+    const filtered = (Array.isArray(state.suppliers) ? state.suppliers : []).filter(s => {
+        if (!s) return false;
+        if (!searchTerm) return true;
+        const has = (v) => String(v || '').toLowerCase().includes(searchTerm);
+        return has(s.name) || has(s.phone) || has(s.gstin);
+    });
 
     list.innerHTML = filtered.map(s => `
         <tr>
-            <td>${s.name}</td>
-            <td style="font-family: monospace; font-size: 0.9em;">${s.gstin || '-'}</td>
-            <td>${s.phone || '-'}</td>
-            <td>${s.email || '-'}</td>
-            <td>${s.address}</td>
-            <td>
+            <td data-label="Name">${s.name || '-'}</td>
+            <td data-label="GSTIN" style="font-family: monospace; font-size: 0.9em;">${s.gstin || '-'}</td>
+            <td data-label="Phone">${s.phone || '-'}</td>
+            <td data-label="Email">${s.email || '-'}</td>
+            <td data-label="Address">${s.address || '-'}</td>
+            <td data-label="Actions" class="row-actions">
                 <button class="action-btn" onclick="openEditSupplierModal('${s.id}')"><i class="fas fa-edit"></i></button>
                 <button class="action-btn" onclick="deleteSupplier('${s.id}')"><i class="fas fa-trash"></i></button>
             </td>
@@ -1198,25 +1375,39 @@ function renderSuppliers() {
 
 function renderExpenses(data) {
     const list = document.getElementById('expenses-list');
-    const searchTerm = state.filters.expenses.toLowerCase();
-    
-    const filtered = data || state.expenses.filter(e => 
-        e.category.toLowerCase().includes(searchTerm) || 
-        e.description.toLowerCase().includes(searchTerm)
-    );
+    if (!list) return;
+    const searchTerm = (state.filters.expenses || '').toLowerCase();
 
-    list.innerHTML = filtered.map(e => `
+    const rows = Array.isArray(data) ? data : (Array.isArray(state.expenses) ? state.expenses : []);
+    const filtered = rows.filter(e => {
+        if (!e) return false;
+        if (!searchTerm) return true;
+        const has = (v) => String(v || '').toLowerCase().includes(searchTerm);
+        return has(e.category) || has(e.description) || has(e.employeeName) || has(e.paymentBy);
+    });
+
+    list.innerHTML = filtered.map(e => {
+        const amount = parseAmount(e.amount);
+        const advance = parseAmount(e.advance);
+        return `
         <tr>
-            <td>${e.date}</td>
-            <td>${e.category}</td>
-            <td>${e.description}</td>
-            <td>₹ ${e.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-            <td>
+            <td data-label="Date">${e.date || '-'}</td>
+            <td data-label="Category">${e.category || '-'}</td>
+            <td data-label="Description">${e.description || '-'}</td>
+            <td data-label="Employee">${e.employeeName || '-'}</td>
+            <td data-label="Payment By">${e.paymentBy || '-'}</td>
+            <td data-label="Advance">₹ ${advance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Amount">₹ ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+            <td data-label="Actions" class="row-actions">
                 <button class="action-btn" onclick="openEditExpenseModal('${e.id}')" title="Edit Expense"><i class="fas fa-edit"></i></button>
                 <button class="action-btn" onclick="deleteExpense('${e.id}')" title="Delete Expense"><i class="fas fa-trash"></i></button>
             </td>
         </tr>
-    `).join('');
+    `;
+    }).join('');
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(list);
+    }
 }
 
 function renderPurchaseInvoices(data) {
@@ -1240,6 +1431,9 @@ function renderPurchaseInvoices(data) {
             <td><span class="status-badge status-${inv.status.toLowerCase()}">${inv.status}</span></td>
             <td>
                 ${inv.attachment ? `<button class="action-btn" onclick="viewInvoicePDF('${inv.id}')" title="View PDF"><i class="fas fa-file-pdf"></i></button>` : ''}
+                <button class="action-btn" onclick="viewPurchase('${inv.id}')" title="View/Print PDF"><i class="fas fa-eye"></i></button>
+                <button class="action-btn" onclick="exportPurchaseToWord('${inv.id}')" title="Export to Word (.docx)" style="color: #2563eb;"><i class="fas fa-file-word"></i></button>
+                <button class="action-btn" onclick="exportPurchaseToExcelInvoice('${inv.id}')" title="Export to Excel (.xlsx)" style="color: #16a34a;"><i class="fas fa-file-excel"></i></button>
                 <button class="action-btn" onclick="openEditPurchaseInvoiceModal('${inv.id}')" title="Edit"><i class="fas fa-edit"></i></button>
                 <button class="action-btn delete-btn" onclick="deletePurchaseInvoice('${inv.id}')" title="Delete"><i class="fas fa-trash"></i></button>
             </td>
@@ -1268,6 +1462,9 @@ function renderSaleInvoices(data) {
             <td><span class="status-badge status-${inv.status.toLowerCase()}">${inv.status}</span></td>
             <td>
                 ${inv.attachment ? `<button class="action-btn" onclick="viewSaleInvoicePDF('${inv.id}')" title="View PDF"><i class="fas fa-file-pdf"></i></button>` : ''}
+                <button class="action-btn" onclick="viewSale('${inv.id}')" title="View/Print PDF"><i class="fas fa-eye"></i></button>
+                <button class="action-btn" onclick="exportSaleToWord('${inv.id}')" title="Export to Word (.docx)" style="color: #2563eb;"><i class="fas fa-file-word"></i></button>
+                <button class="action-btn" onclick="exportSaleToExcelInvoice('${inv.id}')" title="Export to Excel (.xlsx)" style="color: #16a34a;"><i class="fas fa-file-excel"></i></button>
                 <button class="action-btn" onclick="openEditSaleInvoiceModal('${inv.id}')" title="Edit"><i class="fas fa-edit"></i></button>
                 <button class="action-btn delete-btn" onclick="deleteSaleInvoice('${inv.id}')" title="Delete"><i class="fas fa-trash"></i></button>
             </td>
@@ -1353,8 +1550,60 @@ function getNextInvoiceNumber() {
     return `INV-${nextNo.toString().padStart(3, '0')}`;
 }
 
+// ─── Modern Truncated & Responsive Dropdown Options Helpers ───
+window.getProductSelectOptions = (selectedVal = '') => {
+    if (!state.inventory || !Array.isArray(state.inventory)) return '';
+    return state.inventory.map(p => {
+        const isSel = selectedVal && (String(p.id) === String(selectedVal) || p.name === selectedVal || (p.sku && p.sku === selectedVal));
+        const fullName = p.name || 'Unnamed Product';
+        const maxLen = 48;
+        const shortName = fullName.length > maxLen ? fullName.substring(0, maxLen - 3) + '...' : fullName;
+        const display = p.sku ? `[${p.sku}] ${shortName}` : shortName;
+        const safeTitle = fullName.replace(/"/g, '&quot;');
+        return `<option value="${p.id}" title="${safeTitle}" ${isSel ? 'selected' : ''}>${display}</option>`;
+    }).join('');
+};
+
+window.getCustomerSelectOptions = (selectedVal = '') => {
+    if (!state.customers || !Array.isArray(state.customers)) return '';
+    return state.customers.map(c => {
+        const isSel = selectedVal && (String(c.id) === String(selectedVal) || c.name === selectedVal);
+        const fullName = c.name || 'Unnamed Customer';
+        const maxLen = 45;
+        const shortName = fullName.length > maxLen ? fullName.substring(0, maxLen - 3) + '...' : fullName;
+        const safeTitle = fullName.replace(/"/g, '&quot;');
+        return `<option value="${c.id}" title="${safeTitle}" ${isSel ? 'selected' : ''}>${shortName}</option>`;
+    }).join('');
+};
+
+window.getCustomerShipToSelectOptions = (selectedVal = '') => {
+    if (!state.customers || !Array.isArray(state.customers)) return '';
+    return state.customers.map(c => {
+        const isSel = selectedVal && (String(c.id) === String(selectedVal) || c.name === selectedVal);
+        const addr = [c.address, c.state].filter(Boolean).join(', ');
+        const fullName = c.name + (addr ? ` — ${addr}` : '');
+        const maxLen = 50;
+        const shortName = fullName.length > maxLen ? fullName.substring(0, maxLen - 3) + '...' : fullName;
+        const safeTitle = fullName.replace(/"/g, '&quot;');
+        return `<option value="${c.id}" title="${safeTitle}" ${isSel ? 'selected' : ''}>${shortName}</option>`;
+    }).join('');
+};
+
+window.getSupplierSelectOptions = (selectedVal = '') => {
+    if (!state.suppliers || !Array.isArray(state.suppliers)) return '';
+    return state.suppliers.map(s => {
+        const isSel = selectedVal && (String(s.id) === String(selectedVal) || s.name === selectedVal);
+        const fullName = s.name || 'Unnamed Supplier';
+        const maxLen = 45;
+        const shortName = fullName.length > maxLen ? fullName.substring(0, maxLen - 3) + '...' : fullName;
+        const safeTitle = fullName.replace(/"/g, '&quot;');
+        return `<option value="${s.id}" title="${safeTitle}" ${isSel ? 'selected' : ''}>${shortName}</option>`;
+    }).join('');
+};
+
 window.openNewSaleModal = () => {
-    const customerOptions = state.customers.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+    const customerOptions = getCustomerSelectOptions();
+    const shipToOptions = getCustomerShipToSelectOptions();
     const content = `
         <form id="new-sale-form">
             <div class="form-row">
@@ -1377,6 +1626,29 @@ window.openNewSaleModal = () => {
                     <div id="sale-cust-info" style="font-size: 0.8em; color: var(--text-light); margin-top: 4px;"></div>
                 </div>
                 <div class="form-group">
+                    <label>Bill Type</label>
+                    <select id="sale-bill-type" onchange="calculateSaleTotals()" required>
+                        <option value="GST Bill">GST Bill</option>
+                        <option value="Non-GST Bill">Non-GST Bill</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Ship To Customer <span class="label-optional">(Optional)</span></label>
+                    <select id="sale-ship-to-select" onchange="handleSaleShipToSelectChange()">
+                        <option value="">— Select to auto-fill —</option>
+                        <option value="same_as_billing">Same as Billing Customer</option>
+                        ${shipToOptions}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Shipping Address <span class="label-optional">(displayed in invoice only when filled)</span></label>
+                    <input type="text" id="sale-ship-to" placeholder="Name, address, city, state...">
+                </div>
+            </div>
+            <div class="form-row form-row-3">
+                <div class="form-group">
                     <label>GST Type</label>
                     <select id="sale-gst-type" onchange="calculateSaleTotals()" required>
                         <option value="Local">Local (CGST + SGST)</option>
@@ -1394,12 +1666,6 @@ window.openNewSaleModal = () => {
                         <option value="Credit Card">Credit Card</option>
                     </select>
                 </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label>Received Amount (₹)</label>
-                    <input type="number" id="sale-received-amount" step="0.01" value="0.00" oninput="calculateSaleTotals()">
-                </div>
                 <div class="form-group">
                     <label>Status</label>
                     <select id="sale-status">
@@ -1407,6 +1673,12 @@ window.openNewSaleModal = () => {
                         <option value="Pending" selected>Pending</option>
                         <option value="Overdue">Overdue</option>
                     </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Received Amount (₹)</label>
+                    <input type="number" id="sale-received-amount" step="0.01" value="0.00" oninput="calculateSaleTotals()">
                 </div>
                 <div class="form-group">
                     <label>Pending Amount (₹)</label>
@@ -1429,19 +1701,21 @@ window.openNewSaleModal = () => {
                     <tbody id="sale-items-list"></tbody>
                 </table>
             </div>
-            <button type="button" class="btn-primary" style="width: auto; margin-bottom: 1rem;" onclick="addSaleItemRow()">
-                <i class="fas fa-plus"></i> Add Item
-            </button>
-            <div class="totals-section">
-                <div><span>Subtotal:</span> <span id="sale-subtotal">₹ 0.00</span></div>
-                <div><span>Tax Total:</span> <span id="sale-tax-total">₹ 0.00</span></div>
-                <div class="grand-total"><span>Grand Total:</span> <span id="sale-grand-total">₹ 0.00</span></div>
+            <div class="modal-items-footer">
+                <button type="button" class="btn-primary" style="width: auto;" onclick="addSaleItemRow()">
+                    <i class="fas fa-plus"></i> Add Item
+                </button>
+                <div class="totals-section">
+                    <div><span>Subtotal:</span> <span id="sale-subtotal">₹ 0.00</span></div>
+                    <div><span>Tax Total:</span> <span id="sale-tax-total">₹ 0.00</span></div>
+                    <div class="grand-total"><span>Grand Total:</span> <span id="sale-grand-total">₹ 0.00</span></div>
+                </div>
             </div>
-            <div class="form-group" style="margin-top: 1rem;">
+            <div class="form-group">
                 <label>Order Completion Document (PDF/JPG Optional)</label>
                 <input type="file" id="sale-attachment" accept="application/pdf,image/jpeg,image/jpg,image/png">
             </div>
-            <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 2rem;">
+            <div class="modal-form-actions">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
                 <div style="display: flex; gap: 0.5rem;">
                     <button type="submit" class="btn-primary" style="width: auto; background-color: var(--secondary-color);" onclick="this.form.dataset.action='save'">Save Only</button>
@@ -1458,7 +1732,7 @@ window.openNewSaleModal = () => {
 window.addSaleItemRow = () => {
     const tbody = document.getElementById('sale-items-list');
     const rowId = Date.now();
-    const productOptions = state.inventory.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+    const productOptions = getProductSelectOptions();
     const tr = document.createElement('tr');
     tr.id = `row-${rowId}`;
     tr.innerHTML = `
@@ -1471,6 +1745,9 @@ window.addSaleItemRow = () => {
         <td width="50"><button type="button" class="action-btn" onclick="removeSaleRow('${rowId}')"><i class="fas fa-times"></i></button></td>
     `;
     tbody.appendChild(tr);
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(tr);
+    }
     calculateSaleTotals();
 };
 
@@ -1494,11 +1771,30 @@ window.updateSaleRowDetails = (rowId) => {
 };
 
 window.calculateSaleTotals = () => {
-    const gstType = document.getElementById('sale-gst-type')?.value || 'Local';
+    const billType = document.getElementById('sale-bill-type')?.value || 'GST Bill';
+    const gstTypeSelect = document.getElementById('sale-gst-type');
+    const gstType = gstTypeSelect?.value || 'Local';
+    
+    if (gstTypeSelect) {
+        gstTypeSelect.disabled = (billType === 'Non-GST Bill');
+        if (window.ModernDropdown && window.ModernDropdown.sync) {
+            window.ModernDropdown.sync(gstTypeSelect);
+        }
+    }
+    
     const headerRow = document.querySelector('.sale-items-table thead tr');
     
     if (headerRow) {
-        if (gstType === 'Local') {
+        if (billType === 'Non-GST Bill') {
+            headerRow.innerHTML = `
+                <th width="300">Product</th>
+                <th width="120">HSN/SAC</th>
+                <th width="100">Qty</th>
+                <th width="130">Price</th>
+                <th width="140">Total</th>
+                <th width="50"></th>
+            `;
+        } else if (gstType === 'Local') {
             headerRow.innerHTML = `
                 <th width="300">Product</th>
                 <th width="120">HSN/SAC</th>
@@ -1528,19 +1824,31 @@ window.calculateSaleTotals = () => {
     rows.forEach(row => {
         const qty = parseFloat(row.querySelector('.item-qty').value) || 0;
         const price = parseFloat(row.querySelector('.item-price').value) || 0;
-        const totalTaxRate = parseFloat(row.querySelector('.item-tax').dataset.totalTax || 0);
+        let totalTaxRate = 0;
+        
+        if (billType === 'GST Bill') {
+            totalTaxRate = parseFloat(row.querySelector('.item-tax')?.dataset?.totalTax || 0);
+        }
         
         const lineSubtotal = qty * price;
-        const lineTax = lineSubtotal * (totalTaxRate / 100);
+        const lineTax = billType === 'GST Bill' ? lineSubtotal * (totalTaxRate / 100) : 0;
         
         // Update row display
-        if (gstType === 'Local') {
+        if (billType === 'Non-GST Bill') {
+            const taxCell = row.querySelector('.item-tax-cell');
+            if (taxCell) taxCell.innerHTML = '';
+            const sgstCell = row.querySelector('.item-tax-sgst-cell');
+            if (sgstCell) sgstCell.remove();
+        } else if (gstType === 'Local') {
             const halfTax = (totalTaxRate / 2).toFixed(2);
-            row.querySelector('.item-tax-cell').innerHTML = `
-                <input type="number" class="item-tax" data-total-tax="${totalTaxRate}" value="${halfTax}" readonly>
-            `;
+            const taxCell = row.querySelector('.item-tax-cell');
+            if (taxCell) {
+                taxCell.innerHTML = `
+                    <input type="number" class="item-tax" data-total-tax="${totalTaxRate}" value="${halfTax}" readonly>
+                `;
+            }
             // Add second tax cell if missing
-            if (!row.querySelector('.item-tax-sgst')) {
+            if (!row.querySelector('.item-tax-sgst-cell')) {
                 const td = document.createElement('td');
                 td.className = 'item-tax-sgst-cell';
                 td.innerHTML = `<input type="number" class="item-tax-sgst" value="${halfTax}" readonly>`;
@@ -1549,9 +1857,12 @@ window.calculateSaleTotals = () => {
                 row.querySelector('.item-tax-sgst').value = halfTax;
             }
         } else {
-            row.querySelector('.item-tax-cell').innerHTML = `
-                <input type="number" class="item-tax" data-total-tax="${totalTaxRate}" value="${totalTaxRate}" readonly>
-            `;
+            const taxCell = row.querySelector('.item-tax-cell');
+            if (taxCell) {
+                taxCell.innerHTML = `
+                    <input type="number" class="item-tax" data-total-tax="${totalTaxRate}" value="${totalTaxRate}" readonly>
+                `;
+            }
             const sgstCell = row.querySelector('.item-tax-sgst-cell');
             if (sgstCell) sgstCell.remove();
         }
@@ -1563,9 +1874,15 @@ window.calculateSaleTotals = () => {
 
     document.getElementById('sale-subtotal').textContent = `₹ ${subtotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
     
-    const taxLabel = gstType === 'Local' ? 'CGST + SGST' : 'IGST';
-    document.getElementById('sale-tax-total').parentElement.firstChild.textContent = `${taxLabel} Total:`;
-    document.getElementById('sale-tax-total').textContent = `₹ ${taxTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+    if (billType === 'Non-GST Bill') {
+        document.getElementById('sale-tax-total').parentElement.style.display = 'none';
+    } else {
+        document.getElementById('sale-tax-total').parentElement.style.display = 'block';
+        const taxLabel = gstType === 'Local' ? 'CGST + SGST' : 'IGST';
+        document.getElementById('sale-tax-total').parentElement.firstChild.textContent = `${taxLabel} Total:`;
+        document.getElementById('sale-tax-total').textContent = `₹ ${taxTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+    }
+    
     const grandTotal = subtotal + taxTotal;
     document.getElementById('sale-grand-total').textContent = `₹ ${grandTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
     
@@ -1638,6 +1955,7 @@ async function handleSaleSubmit(e) {
         const customerId = document.getElementById('sale-customer').value;
         const customer = state.customers.find(c => c.id == customerId);
         const date = document.getElementById('sale-date').value;
+        const billType = document.getElementById('sale-bill-type').value;
         const gstType = document.getElementById('sale-gst-type').value;
         const paymentMode = document.getElementById('sale-payment-mode').value;
         const items = [];
@@ -1646,7 +1964,9 @@ async function handleSaleSubmit(e) {
             const product = state.inventory.find(p => p.id == productId);
             const qty = parseInt(row.querySelector('.item-qty').value);
             
-            const totalTaxRate = parseFloat(row.querySelector('.item-tax').dataset.totalTax || 0);
+            // Safe access — tax input may not exist for Non-GST bills
+            const taxInput = row.querySelector('.item-tax');
+            const totalTaxRate = taxInput ? parseFloat(taxInput.dataset.totalTax || 0) : 0;
 
             items.push({ 
                 name: product.name, 
@@ -1690,6 +2010,8 @@ async function handleSaleSubmit(e) {
         const receivedAmount = parseFloat(document.getElementById('sale-received-amount').value) || 0;
         const status = document.getElementById('sale-status').value;
         const pendingAmount = parseFloat(grandTotalRaw) - receivedAmount;
+        const shipTo = document.getElementById('sale-ship-to') ? document.getElementById('sale-ship-to').value.trim() : '';
+        const shipToCustomerId = document.getElementById('sale-ship-to-select') ? document.getElementById('sale-ship-to-select').value : '';
 
         const saleDoc = { 
             _id: invoiceNo,
@@ -1697,6 +2019,9 @@ async function handleSaleSubmit(e) {
             date, 
             customer: customer.name, 
             customerObj: customer,
+            shipTo,
+            shipToCustomerId,
+            billType,
             gstType,
             items, 
             subtotal: subtotalRaw, 
@@ -1726,7 +2051,7 @@ async function handleSaleSubmit(e) {
         
         await saveAppState(); // Updates stats and charts
         if (e.target.dataset.action === 'generate') {
-            await generateInvoicePDF(invoiceNo, date, customer, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, 'Sales', paymentMode);
+            await generateInvoicePDF(invoiceNo, date, customer, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, billType, 'Sales', paymentMode, shipTo);
             showToast(`Sale saved! Invoice ${invoiceNo} generated.`);
         } else {
             showToast(`Sale saved!`);
@@ -1752,6 +2077,7 @@ async function handleSaleUpdate(e) {
         const customerId = document.getElementById('sale-customer').value;
         const customer = state.customers.find(c => c.id == customerId);
         const date = document.getElementById('sale-date').value;
+        const billType = document.getElementById('sale-bill-type').value;
         const gstType = document.getElementById('sale-gst-type').value;
         const paymentMode = document.getElementById('sale-payment-mode').value;
         const items = [];
@@ -1760,7 +2086,8 @@ async function handleSaleUpdate(e) {
             const productId = row.querySelector('.item-product').value;
             const product = state.inventory.find(p => p.id == productId);
             const qty = parseInt(row.querySelector('.item-qty').value);
-            const totalTaxRate = parseFloat(row.querySelector('.item-tax').dataset.totalTax || 0);
+            const taxInput = row.querySelector('.item-tax');
+            const totalTaxRate = taxInput ? parseFloat(taxInput.dataset.totalTax || 0) : 0;
 
             items.push({ 
                 name: product.name, 
@@ -1802,6 +2129,8 @@ async function handleSaleUpdate(e) {
             const receivedAmount = parseFloat(document.getElementById('sale-received-amount').value) || 0;
             const status = document.getElementById('sale-status').value;
             const pendingAmount = parseFloat(grandTotalRaw) - receivedAmount;
+            const shipTo = document.getElementById('sale-ship-to') ? document.getElementById('sale-ship-to').value.trim() : '';
+            const shipToCustomerId = document.getElementById('sale-ship-to-select') ? document.getElementById('sale-ship-to-select').value : '';
 
             let attachmentBase64 = oldSale.attachment; // Corrected: use oldSale instead of sale
             const fileInput = document.getElementById('sale-attachment');
@@ -1820,6 +2149,9 @@ async function handleSaleUpdate(e) {
                 date, 
                 customer: customer.name, 
                 customerObj: customer,
+                shipTo,
+                shipToCustomerId,
+                billType,
                 gstType,
                 items, 
                 subtotal: subtotalRaw, 
@@ -1839,7 +2171,7 @@ async function handleSaleUpdate(e) {
             await saveAppState();
             
             if (e.target.dataset.action === 'generate') {
-                await generateInvoicePDF(invoiceNo, date, customer, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, 'Sales', paymentMode);
+                await generateInvoicePDF(invoiceNo, date, customer, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, billType, 'Sales', paymentMode, shipTo);
                 showToast(`Invoice ${invoiceNo} updated and re-generated.`);
             } else {
                 showToast(`Invoice ${invoiceNo} updated.`);
@@ -1861,7 +2193,8 @@ window.openEditSaleModal = (id) => {
         return;
     }
 
-    const customerOptions = state.customers.map(c => `<option value="${c.id}" ${c.name === sale.customer ? 'selected' : ''}>${c.name}</option>`).join('');
+    const customerOptions = getCustomerSelectOptions(sale.customer);
+    const shipToOptions = getCustomerShipToSelectOptions(sale.shipToCustomerId);
     
     const content = `
         <form id="edit-sale-form">
@@ -1885,6 +2218,29 @@ window.openEditSaleModal = (id) => {
                     <div id="sale-cust-info" style="font-size: 0.8em; color: var(--text-light); margin-top: 4px;"></div>
                 </div>
                 <div class="form-group">
+                    <label>Bill Type</label>
+                    <select id="sale-bill-type" onchange="calculateSaleTotals()" required>
+                        <option value="GST Bill" ${sale.billType === 'GST Bill' || !sale.billType ? 'selected' : ''}>GST Bill</option>
+                        <option value="Non-GST Bill" ${sale.billType === 'Non-GST Bill' ? 'selected' : ''}>Non-GST Bill</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Ship To Customer <span class="label-optional">(Optional)</span></label>
+                    <select id="sale-ship-to-select" onchange="handleSaleShipToSelectChange()">
+                        <option value="">— Select to auto-fill —</option>
+                        <option value="same_as_billing">Same as Billing Customer</option>
+                        ${shipToOptions}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Shipping Address <span class="label-optional">(displayed in invoice only when filled)</span></label>
+                    <input type="text" id="sale-ship-to" placeholder="Name, address, city, state..." value="${sale.shipTo ? sale.shipTo.replace(/"/g, '&quot;') : ''}">
+                </div>
+            </div>
+            <div class="form-row form-row-3">
+                <div class="form-group">
                     <label>GST Type</label>
                     <select id="sale-gst-type" onchange="calculateSaleTotals()" required>
                         <option value="Local" ${sale.gstType === 'Local' ? 'selected' : ''}>Local (CGST + SGST)</option>
@@ -1902,12 +2258,6 @@ window.openEditSaleModal = (id) => {
                         <option value="Credit Card" ${sale.paymentMode === 'Credit Card' ? 'selected' : ''}>Credit Card</option>
                     </select>
                 </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label>Received Amount (₹)</label>
-                    <input type="number" id="sale-received-amount" step="0.01" value="${sale.receivedAmount || 0}" oninput="calculateSaleTotals()">
-                </div>
                 <div class="form-group">
                     <label>Status</label>
                     <select id="sale-status">
@@ -1915,6 +2265,12 @@ window.openEditSaleModal = (id) => {
                         <option value="Pending" ${sale.status === 'Pending' ? 'selected' : ''}>Pending</option>
                         <option value="Overdue" ${sale.status === 'Overdue' ? 'selected' : ''}>Overdue</option>
                     </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Received Amount (₹)</label>
+                    <input type="number" id="sale-received-amount" step="0.01" value="${sale.receivedAmount || 0}" oninput="calculateSaleTotals()">
                 </div>
                 <div class="form-group">
                     <label>Pending Amount (₹)</label>
@@ -1937,20 +2293,22 @@ window.openEditSaleModal = (id) => {
                     <tbody id="sale-items-list"></tbody>
                 </table>
             </div>
-            <button type="button" class="btn-primary" style="width: auto; margin-bottom: 1rem;" onclick="addSaleItemRow()">
-                <i class="fas fa-plus"></i> Add Item
-            </button>
-            <div class="totals-section">
-                <div><span>Subtotal:</span> <span id="sale-subtotal">₹ 0.00</span></div>
-                <div><span>Tax Total:</span> <span id="sale-tax-total">₹ 0.00</span></div>
-                <div class="grand-total"><span>Grand Total:</span> <span id="sale-grand-total">₹ 0.00</span></div>
+            <div class="modal-items-footer">
+                <button type="button" class="btn-primary" style="width: auto;" onclick="addSaleItemRow()">
+                    <i class="fas fa-plus"></i> Add Item
+                </button>
+                <div class="totals-section">
+                    <div><span>Subtotal:</span> <span id="sale-subtotal">₹ 0.00</span></div>
+                    <div><span>Tax Total:</span> <span id="sale-tax-total">₹ 0.00</span></div>
+                    <div class="grand-total"><span>Grand Total:</span> <span id="sale-grand-total">₹ 0.00</span></div>
+                </div>
             </div>
-            <div class="form-group" style="margin-top: 1rem;">
+            <div class="form-group">
                 <label>Replace Order Completion Document (Optional)</label>
                 <input type="file" id="sale-attachment" accept="application/pdf,image/jpeg,image/jpg,image/png">
                 ${sale.attachment ? '<small style="color:var(--text-muted);display:block;margin-top:4px;">Currently attached. Uploading new will overwrite.</small>' : ''}
             </div>
-            <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 2rem;">
+            <div class="modal-form-actions">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
                 <div style="display: flex; gap: 0.5rem;">
                     <button type="submit" class="btn-primary" style="width: auto; background-color: var(--secondary-color);" onclick="this.form.dataset.action='save'">Update Only</button>
@@ -1979,7 +2337,7 @@ window.openEditSaleModal = (id) => {
 window.addSaleItemRowWithData = (item) => {
     const tbody = document.getElementById('sale-items-list');
     const rowId = Date.now() + Math.random();
-    const productOptions = state.inventory.map(p => `<option value="${p.id}" ${p.name === item.name ? 'selected' : ''}>${p.name}</option>`).join('');
+    const productOptions = getProductSelectOptions(item.name);
     const tr = document.createElement('tr');
     tr.id = `row-${rowId}`;
     tr.innerHTML = `
@@ -1992,6 +2350,9 @@ window.addSaleItemRowWithData = (item) => {
         <td width="50"><button type="button" class="action-btn" onclick="removeSaleRow('${rowId}')"><i class="fas fa-times"></i></button></td>
     `;
     tbody.appendChild(tr);
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(tr);
+    }
 };
 
 
@@ -2004,7 +2365,7 @@ window.viewSale = async (id) => {
     }
     
     if (sale.customerObj && sale.items) {
-        await generateInvoicePDF(sale.id, sale.date, sale.customerObj, sale.items, sale.subtotal, sale.tax, sale.total, sale.gstType || 'Local', 'Sales', sale.paymentMode || '');
+        await generateInvoicePDF(sale.id, sale.date, sale.customerObj, sale.items, sale.subtotal, sale.tax, sale.total, sale.gstType || 'Local', sale.billType || 'GST Bill', 'Sales', sale.paymentMode || '', sale.shipTo || '');
         showToast('Invoice re-generated');
     } else {
         showToast('Invoice detail not available for this record.', 'warning');
@@ -2019,7 +2380,7 @@ window.viewPurchase = async (id) => {
     }
     
     if (pur.supplierObj && pur.items) {
-        await generateInvoicePDF(pur.id, pur.date, pur.supplierObj, pur.items, pur.subtotal, pur.tax, pur.total, pur.gstType || 'Local', 'Purchases', pur.paymentMode || '');
+        await generateInvoicePDF(pur.id, pur.date, pur.supplierObj, pur.items, pur.subtotal, pur.tax, pur.total, pur.gstType || 'Local', pur.billType || 'GST Bill', 'Purchases', pur.paymentMode || '', pur.shipTo || '');
         showToast('Bill re-generated');
     } else {
         showToast('Bill detail not available for this record.', 'warning');
@@ -2068,7 +2429,7 @@ window.deletePurchase = (id) => {
     }
 };
 
-async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTotal, gstType = 'Local', type = 'Sales', paymentMode = '') {
+async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTotal, gstType = 'Local', billType = 'GST Bill', type = 'Sales', paymentMode = '', shipTo = '') {
     const isPurchase = type === 'Purchases';
     
     // Dynamically refresh party info to ensure it's not stale
@@ -2086,7 +2447,11 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
     const comp = state.company;
     
     // Header Title
-    document.querySelector('.gst-invoice-title').textContent = isPurchase ? 'Purchase Bill' : 'Tax Invoice';
+    if (billType === 'Non-GST Bill') {
+        document.querySelector('.gst-invoice-title').textContent = isPurchase ? 'Purchase Bill' : 'Invoice';
+    } else {
+        document.querySelector('.gst-invoice-title').textContent = isPurchase ? 'Purchase Bill' : 'Tax Invoice';
+    }
     document.getElementById('gst-sig-label').textContent = isPurchase ? `For : ${party.name}` : `For : ${comp.legalName}`;
 
     // Company Header
@@ -2100,7 +2465,23 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
     document.getElementById('gst-company-legal-name').textContent = comp.legalName || '';
     document.getElementById('gst-company-address').textContent = comp.address || '';
     document.getElementById('gst-company-contact').textContent = `Phone no.: ${comp.phone || ''} Email: ${comp.email || ''}`;
-    document.getElementById('gst-company-gstin').textContent = comp.gstin || '';
+    
+    const websiteEl = document.getElementById('gst-company-website');
+    if (websiteEl) {
+        if (comp.website && comp.website.trim()) {
+            websiteEl.textContent = `Website: ${comp.website.trim()}`;
+            websiteEl.style.display = 'block';
+        } else {
+            websiteEl.style.display = 'none';
+        }
+    }
+    
+    if (billType === 'Non-GST Bill') {
+        document.getElementById('gst-company-gstin').parentElement.style.display = 'none';
+    } else {
+        document.getElementById('gst-company-gstin').parentElement.style.display = 'block';
+        document.getElementById('gst-company-gstin').textContent = comp.gstin || '';
+    }
     document.getElementById('gst-company-state').textContent = comp.state || '';
 
     // Meta
@@ -2111,15 +2492,13 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
     const supplyState = party.state || (isPurchase ? comp.state : (party.address.split(',').pop() || comp.state));
     document.getElementById('gst-inv-supply').textContent = supplyState;
     
-    // Billing & Shipping logic reversed for Purchase
-    if (isPurchase) {        document.getElementById('gst-bill-name').textContent = party.name;
+    // Billing logic
+    if (isPurchase) {
+        document.getElementById('gst-bill-name').textContent = party.name;
         document.getElementById('gst-bill-address').innerHTML = party.address.replace(/\n/g, '<br>');
         document.getElementById('gst-bill-gstin').textContent = party.gstin || 'N/A';
         document.getElementById('gst-bill-state').textContent = party.state || 'N/A';
 
-        document.getElementById('gst-ship-name').textContent = comp.legalName;
-        document.getElementById('gst-ship-address').innerHTML = comp.address.replace(/\n/g, '<br>');
-        
         // Hide bank details for purchase bill (since it's their bank, not ours)
         document.querySelector('.gst-bank-details').style.visibility = 'hidden';
     } else {
@@ -2129,15 +2508,57 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
         document.getElementById('gst-bill-gstin').textContent = party.gstin || 'N/A';
         document.getElementById('gst-bill-state').textContent = party.state || 'N/A';
 
-        document.getElementById('gst-ship-name').textContent = party.name;
-        document.getElementById('gst-ship-address').innerHTML = party.address.replace(/\n/g, '<br>');
-        
         document.querySelector('.gst-bank-details').style.visibility = 'visible';
+    }
+    
+    // Shipping logic: Ship To section is optional and displayed ONLY when user enters shipping details.
+    // If no shipping details entered, the Ship To section does not appear in the invoice.
+    // Applied to BOTH Sales and Purchase invoices.
+    const shipToSection = document.getElementById('gst-ship-to-section') || document.querySelector('.gst-ship-to');
+    if (shipTo && shipTo.trim()) {
+        if (shipToSection) shipToSection.style.display = 'block';
+        const shipVal = shipTo.trim();
+        const lines = shipVal.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        if (lines.length > 1) {
+            document.getElementById('gst-ship-name').textContent = lines[0];
+            document.getElementById('gst-ship-name').style.display = 'block';
+            document.getElementById('gst-ship-address').innerHTML = lines.slice(1).join('<br>');
+            document.getElementById('gst-ship-address').style.display = 'block';
+        } else if (shipVal.includes(',')) {
+            const firstComma = shipVal.indexOf(',');
+            document.getElementById('gst-ship-name').textContent = shipVal.substring(0, firstComma).trim();
+            document.getElementById('gst-ship-name').style.display = 'block';
+            document.getElementById('gst-ship-address').innerHTML = shipVal.substring(firstComma + 1).split(',').map(s => s.trim()).filter(Boolean).join('<br>');
+            document.getElementById('gst-ship-address').style.display = 'block';
+        } else {
+            document.getElementById('gst-ship-name').textContent = shipVal;
+            document.getElementById('gst-ship-name').style.display = 'block';
+            document.getElementById('gst-ship-address').innerHTML = '';
+            document.getElementById('gst-ship-address').style.display = 'none';
+        }
+    } else {
+        if (shipToSection) shipToSection.style.display = 'none';
+    }
+    
+    // If Non-GST, hide GSTIN from billing as well
+    if (billType === 'Non-GST Bill') {
+        document.getElementById('gst-bill-gstin').parentElement.style.display = 'none';
+    } else {
+        document.getElementById('gst-bill-gstin').parentElement.style.display = 'block';
     }
     
     // Items Table Header
     const tableHeader = document.querySelector('.gst-items-table thead tr');
-    if (gstType === 'Local') {
+    if (billType === 'Non-GST Bill') {
+        tableHeader.innerHTML = `
+            <th width="5%">#</th>
+            <th width="45%">Description of Goods</th>
+            <th width="15%">HSN/SAC</th>
+            <th width="10%">Qty</th>
+            <th width="10%">Rate</th>
+            <th width="15%">Amount</th>
+        `;
+    } else if (gstType === 'Local') {
         tableHeader.innerHTML = `
             <th width="5%">#</th>
             <th width="35%">Description of Goods</th>
@@ -2162,7 +2583,18 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
 
     // Items
     document.getElementById('gst-items-list').innerHTML = items.map((item, index) => {
-        if (gstType === 'Local') {
+        if (billType === 'Non-GST Bill') {
+            return `
+                <tr>
+                    <td>${index + 1}</td>
+                    <td>${item.name}</td>
+                    <td>${item.hsn}</td>
+                    <td>${item.qty}</td>
+                    <td>₹ ${parseFloat(item.price).toLocaleString()}</td>
+                    <td>₹ ${parseFloat(item.total).toLocaleString()}</td>
+                </tr>
+            `;
+        } else if (gstType === 'Local') {
             const halfTax = (item.tax / 2).toFixed(2);
             return `
                 <tr>
@@ -2193,7 +2625,13 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
     
     // Totals Section Logic
     const totalsContainer = document.querySelector('.gst-amounts-col');
-    if (gstType === 'Local') {
+    if (billType === 'Non-GST Bill') {
+        totalsContainer.innerHTML = `
+            <div class="gst-amounts-label">Amounts</div>
+            <div class="gst-amount-row"><span>Sub Total</span> <span id="gst-subtotal">₹ ${parseFloat(subtotal).toLocaleString()}</span></div>
+            <div class="gst-total-row"><span>Total</span> <span id="gst-grand-total">₹ ${amountVal.toLocaleString()}</span></div>
+        `;
+    } else if (gstType === 'Local') {
         const halfTaxVal = (parseFloat(tax) / 2).toFixed(2);
         totalsContainer.innerHTML = `
             <div class="gst-amounts-label">Amounts</div>
@@ -2211,6 +2649,35 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
         `;
     }
 
+    // Update the Tax Details panel dynamically
+    const taxDetailsCol = document.querySelector('.gst-tax-details-col');
+    if (taxDetailsCol) {
+        if (billType === 'Non-GST Bill') {
+            taxDetailsCol.style.display = 'none';
+        } else {
+            taxDetailsCol.style.display = 'block';
+            // Compute unique tax rates from items
+            const taxMap = {};
+            items.forEach(item => {
+                const rate = parseFloat(item.tax) || 0;
+                if (rate > 0) {
+                    if (!taxMap[rate]) taxMap[rate] = 0;
+                    const lineAmt = (parseFloat(item.qty) * parseFloat(item.price));
+                    taxMap[rate] += lineAmt * rate / 100;
+                }
+            });
+            const taxLines = Object.entries(taxMap).map(([rate, amt]) => {
+                if (gstType === 'Local') {
+                    const half = (parseFloat(rate) / 2).toFixed(1);
+                    return `<div style="margin-bottom:4px;"><strong>${rate}% GST</strong> (CGST ${half}% + SGST ${half}%): ₹${amt.toLocaleString('en-IN', {minimumFractionDigits:2})}</div>`;
+                } else {
+                    return `<div style="margin-bottom:4px;"><strong>IGST ${rate}%</strong>: ₹${amt.toLocaleString('en-IN', {minimumFractionDigits:2})}</div>`;
+                }
+            }).join('');
+            taxDetailsCol.innerHTML = `<div class="gst-tax-label">Tax Details</div>${taxLines || '<div style="color:#64748b;">No tax applied</div>'}`;
+        }
+    }
+
     document.getElementById('gst-amount-words').textContent = amountToWords(amountVal);
     
     // Payment Mode logic
@@ -2223,32 +2690,54 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
         paymentContainer.style.display = 'none';
     }
     
+    // Terms & Conditions
+    const termsSection = document.getElementById('gst-terms-section');
+    if (comp.terms && comp.terms.trim()) {
+        document.getElementById('gst-company-terms').textContent = comp.terms;
+        if (termsSection) termsSection.style.display = 'block';
+    } else {
+        if (termsSection) termsSection.style.display = 'none';
+    }
+    
     // Footer
-    document.getElementById('gst-bank-name').textContent = `Name : ${comp.bankName}`;
-    document.getElementById('gst-bank-acc').textContent = `Account No. : ${comp.accountNo}`;
-    document.getElementById('gst-bank-ifsc').textContent = `IFSC code : ${comp.ifscCode}`;
-    document.getElementById('gst-bank-holder').textContent = `Account holder's name : ${comp.accountHolder}`;
-    document.getElementById('gst-company-terms').textContent = comp.terms;
-    document.getElementById('gst-sig-label').textContent = `For : ${comp.legalName}`;
+    document.getElementById('gst-bank-name').textContent = `Name : ${comp.bankName || ''}`;
+    const branchEl = document.getElementById('gst-bank-branch');
+    if (branchEl) {
+        if (comp.branchAddress && comp.branchAddress.trim()) {
+            branchEl.textContent = `Branch Address : ${comp.branchAddress.trim()}`;
+            branchEl.style.display = 'block';
+        } else {
+            branchEl.style.display = 'none';
+        }
+    }
+    document.getElementById('gst-bank-acc').textContent = `Account No. : ${comp.accountNo || ''}`;
+    document.getElementById('gst-bank-ifsc').textContent = `IFSC code : ${comp.ifscCode || ''}`;
+    document.getElementById('gst-bank-holder').textContent = `Account holder's name : ${comp.accountHolder || ''}`;
+    document.getElementById('gst-sig-label').textContent = isPurchase ? `For : ${party.name}` : `For : ${comp.legalName}`;
 
-    // Handle QR Code
+    // Handle QR Code — hide entirely if no QR uploaded
+    const qrSection = document.getElementById('gst-qr-section');
     if (comp.qrUrl) {
         document.getElementById('gst-bank-qr-img').src = comp.qrUrl;
         document.getElementById('gst-bank-qr-img').style.display = 'inline-block';
         document.getElementById('gst-bank-qr-icon').style.display = 'none';
+        if (qrSection) qrSection.style.display = 'flex';
     } else {
-        document.getElementById('gst-bank-qr-img').style.display = 'none';
-        document.getElementById('gst-bank-qr-icon').style.display = 'inline-block';
+        // No QR uploaded — hide the entire QR placeholder box
+        if (qrSection) qrSection.style.display = 'none';
     }
 
-    // Handle Signature
+    // Handle Signature — hide mock if no sig uploaded
+    const sigMock = document.getElementById('gst-sig-mock');
+    const sigImg = document.getElementById('gst-sig-img');
     if (comp.sigUrl) {
-        document.getElementById('gst-sig-img').src = comp.sigUrl;
-        document.getElementById('gst-sig-img').style.display = 'inline-block';
-        document.getElementById('gst-sig-mock').style.display = 'none';
+        sigImg.src = comp.sigUrl;
+        sigImg.style.display = 'inline-block';
+        if (sigMock) sigMock.style.display = 'none';
     } else {
-        document.getElementById('gst-sig-img').style.display = 'none';
-        document.getElementById('gst-sig-mock').style.display = 'block';
+        sigImg.style.display = 'none';
+        // Hide the mock signature — show blank space instead
+        if (sigMock) sigMock.style.display = 'none';
     }
 
     const element = document.querySelector('.gst-invoice-container');
@@ -2256,11 +2745,15 @@ async function generateInvoicePDF(no, date, party, items, subtotal, tax, grandTo
     template.classList.remove('hidden');
     try {
         await html2pdf().set({ 
-            margin: 0, 
-            filename: `Invoice_${no}.pdf`, 
+            margin: [8, 8, 8, 8],
+            filename: `${isPurchase ? 'Purchase_Bill' : 'Invoice'}_${no}.pdf`, 
             image: { type: 'jpeg', quality: 0.98 }, 
-            html2canvas: { scale: 2 }, 
-            jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' } 
+            html2canvas: { scale: 2, useCORS: true, logging: false, scrollY: 0 },
+            jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+            pagebreak: { 
+                mode: ['css', 'legacy'], 
+                avoid: ['tr', '.gst-header-section', '.gst-bill-ship-row', '.gst-tax-summary-row', '.gst-payment-info-row', '.gst-terms-section', '.gst-footer-section'] 
+            }
         }).from(element).save();
     } finally {
         template.classList.add('hidden');
@@ -2279,7 +2772,8 @@ function getNextPurchaseNumber() {
 }
 
 window.openNewPurchaseModal = () => {
-    const supplierOptions = state.suppliers.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+    const supplierOptions = getSupplierSelectOptions();
+    const shipToOptions = getCustomerShipToSelectOptions();
     const content = `
         <form id="new-purchase-form">
             <div class="form-row">
@@ -2302,6 +2796,29 @@ window.openNewPurchaseModal = () => {
                     <div id="pur-sup-info" style="font-size: 0.8em; color: var(--text-light); margin-top: 4px;"></div>
                 </div>
                 <div class="form-group">
+                    <label>Bill Type</label>
+                    <select id="pur-bill-type" onchange="calculatePurchaseTotals()" required>
+                        <option value="GST Bill">GST Bill</option>
+                        <option value="Non-GST Bill">Non-GST Bill</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Ship To Customer <span class="label-optional">(Optional)</span></label>
+                    <select id="pur-ship-to-select" onchange="handlePurchaseShipToSelectChange()">
+                        <option value="">— Select to auto-fill —</option>
+                        <option value="company_address">Our Company Address (Default)</option>
+                        ${shipToOptions}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Shipping Address <span class="label-optional">(displayed in invoice only when filled)</span></label>
+                    <input type="text" id="pur-ship-to" placeholder="Name, address, city, state...">
+                </div>
+            </div>
+            <div class="form-row form-row-3">
+                <div class="form-group">
                     <label>GST Type</label>
                     <select id="pur-gst-type" onchange="calculatePurchaseTotals()" required>
                         <option value="Local">Local (CGST + SGST)</option>
@@ -2319,12 +2836,6 @@ window.openNewPurchaseModal = () => {
                         <option value="Credit Card">Credit Card</option>
                     </select>
                 </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label>Paid Amount (₹)</label>
-                    <input type="number" id="pur-paid-amount" step="0.01" value="0.00" oninput="calculatePurchaseTotals()">
-                </div>
                 <div class="form-group">
                     <label>Status</label>
                     <select id="pur-status">
@@ -2332,6 +2843,12 @@ window.openNewPurchaseModal = () => {
                         <option value="Pending" selected>Pending</option>
                         <option value="Overdue">Overdue</option>
                     </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Paid Amount (₹)</label>
+                    <input type="number" id="pur-paid-amount" step="0.01" value="0.00" oninput="calculatePurchaseTotals()">
                 </div>
                 <div class="form-group">
                     <label>Pending Amount (₹)</label>
@@ -2354,19 +2871,21 @@ window.openNewPurchaseModal = () => {
                     <tbody id="pur-items-list"></tbody>
                 </table>
             </div>
-            <button type="button" class="btn-primary" style="width: auto; margin-bottom: 1rem;" onclick="addPurchaseItemRow()">
-                <i class="fas fa-plus"></i> Add Item
-            </button>
-            <div class="totals-section">
-                <div class="total-row"><span>Sub Total:</span> <span id="pur-subtotal">₹ 0.00</span></div>
-                <div class="total-row"><span>Tax Total:</span> <span id="pur-tax-total">₹ 0.00</span></div>
-                <div class="grand-total"><span>Grand Total:</span> <span id="pur-grand-total">₹ 0.00</span></div>
+            <div class="modal-items-footer">
+                <button type="button" class="btn-primary" style="width: auto;" onclick="addPurchaseItemRow()">
+                    <i class="fas fa-plus"></i> Add Item
+                </button>
+                <div class="totals-section">
+                    <div><span>Sub Total:</span> <span id="pur-subtotal">₹ 0.00</span></div>
+                    <div><span>Tax Total:</span> <span id="pur-tax-total">₹ 0.00</span></div>
+                    <div class="grand-total"><span>Grand Total:</span> <span id="pur-grand-total">₹ 0.00</span></div>
+                </div>
             </div>
-            <div class="form-group" style="margin-top: 1rem;">
+            <div class="form-group">
                 <label>Purchase Bill/Receipt Attachment (Optional)</label>
                 <input type="file" id="pur-attachment" accept="application/pdf,image/jpeg,image/jpg,image/png">
             </div>
-            <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 2rem;">
+            <div class="modal-form-actions">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
                 <div style="display: flex; gap: 0.5rem;">
                     <button type="submit" class="btn-primary" style="width: auto; background-color: var(--secondary-color);" onclick="this.form.dataset.action='save'">Save Only</button>
@@ -2384,9 +2903,8 @@ window.openEditPurchaseModal = (id) => {
     const pur = state.purchases.find(p => p.id === id);
     if (!pur) return;
 
-    const supplierOptions = state.suppliers.map(s => `
-        <option value="${s.id}" ${pur.supplierObj && pur.supplierObj.id == s.id ? 'selected' : ''}>${s.name}</option>
-    `).join('');
+    const supplierOptions = getSupplierSelectOptions(pur.supplierObj ? pur.supplierObj.id : pur.supplier);
+    const shipToOptions = getCustomerShipToSelectOptions(pur.shipToCustomerId);
 
     const content = `
         <form id="edit-purchase-form">
@@ -2411,6 +2929,29 @@ window.openEditPurchaseModal = (id) => {
                     <div id="pur-sup-info" style="font-size: 0.8em; color: var(--text-light); margin-top: 4px;"></div>
                 </div>
                 <div class="form-group">
+                    <label>Bill Type</label>
+                    <select id="pur-bill-type" onchange="calculatePurchaseTotals()" required>
+                        <option value="GST Bill" ${pur.billType === 'GST Bill' || !pur.billType ? 'selected' : ''}>GST Bill</option>
+                        <option value="Non-GST Bill" ${pur.billType === 'Non-GST Bill' ? 'selected' : ''}>Non-GST Bill</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Ship To Customer <span class="label-optional">(Optional)</span></label>
+                    <select id="pur-ship-to-select" onchange="handlePurchaseShipToSelectChange()">
+                        <option value="">— Select to auto-fill —</option>
+                        <option value="company_address">Our Company Address (Default)</option>
+                        ${shipToOptions}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Shipping Address <span class="label-optional">(displayed in invoice only when filled)</span></label>
+                    <input type="text" id="pur-ship-to" placeholder="Name, address, city, state..." value="${pur.shipTo ? pur.shipTo.replace(/"/g, '&quot;') : ''}">
+                </div>
+            </div>
+            <div class="form-row form-row-3">
+                <div class="form-group">
                     <label>GST Type</label>
                     <select id="pur-gst-type" onchange="calculatePurchaseTotals()" required>
                         <option value="Local" ${pur.gstType === 'Local' ? 'selected' : ''}>Local (CGST + SGST)</option>
@@ -2428,12 +2969,6 @@ window.openEditPurchaseModal = (id) => {
                         <option value="Credit Card" ${pur.paymentMode === 'Credit Card' ? 'selected' : ''}>Credit Card</option>
                     </select>
                 </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label>Paid Amount (₹)</label>
-                    <input type="number" id="pur-paid-amount" step="0.01" value="${pur.paidAmount || 0}" oninput="calculatePurchaseTotals()">
-                </div>
                 <div class="form-group">
                     <label>Status</label>
                     <select id="pur-status">
@@ -2441,6 +2976,12 @@ window.openEditPurchaseModal = (id) => {
                         <option value="Pending" ${pur.status === 'Pending' ? 'selected' : ''}>Pending</option>
                         <option value="Overdue" ${pur.status === 'Overdue' ? 'selected' : ''}>Overdue</option>
                     </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Paid Amount (₹)</label>
+                    <input type="number" id="pur-paid-amount" step="0.01" value="${pur.paidAmount || 0}" oninput="calculatePurchaseTotals()">
                 </div>
                 <div class="form-group">
                     <label>Pending Amount (₹)</label>
@@ -2463,20 +3004,22 @@ window.openEditPurchaseModal = (id) => {
                     <tbody id="pur-items-list"></tbody>
                 </table>
             </div>
-            <button type="button" class="btn-primary" style="width: auto; margin-bottom: 1rem;" onclick="addPurchaseItemRow()">
-                <i class="fas fa-plus"></i> Add Item
-            </button>
-            <div class="totals-section">
-                <div class="total-row"><span>Sub Total:</span> <span id="pur-subtotal">₹ 0.00</span></div>
-                <div class="total-row"><span>Tax Total:</span> <span id="pur-tax-total">₹ 0.00</span></div>
-                <div class="grand-total"><span>Grand Total:</span> <span id="pur-grand-total">₹ 0.00</span></div>
+            <div class="modal-items-footer">
+                <button type="button" class="btn-primary" style="width: auto;" onclick="addPurchaseItemRow()">
+                    <i class="fas fa-plus"></i> Add Item
+                </button>
+                <div class="totals-section">
+                    <div><span>Sub Total:</span> <span id="pur-subtotal">₹ 0.00</span></div>
+                    <div><span>Tax Total:</span> <span id="pur-tax-total">₹ 0.00</span></div>
+                    <div class="grand-total"><span>Grand Total:</span> <span id="pur-grand-total">₹ 0.00</span></div>
+                </div>
             </div>
-            <div class="form-group" style="margin-top: 1rem;">
+            <div class="form-group">
                 <label>Replace Bill/Receipt Attachment (Optional)</label>
                 <input type="file" id="pur-attachment" accept="application/pdf,image/jpeg,image/jpg,image/png">
                 ${pur.attachment ? '<small style="color:var(--text-muted);display:block;margin-top:4px;">Currently attached. Uploading new will overwrite.</small>' : ''}
             </div>
-            <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 2rem;">
+            <div class="modal-form-actions">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
                 <div style="display: flex; gap: 0.5rem;">
                     <button type="submit" class="btn-primary" style="width: auto; background-color: var(--secondary-color);" onclick="this.form.dataset.action='save'">Update Only</button>
@@ -2491,9 +3034,7 @@ window.openEditPurchaseModal = (id) => {
     const tbody = document.getElementById('pur-items-list');
     pur.items.forEach(item => {
         const rowId = Date.now() + Math.random();
-        const productOptions = state.inventory.map(p => `
-            <option value="${p.id}" ${p.sku === item.code ? 'selected' : ''}>${p.name}</option>
-        `).join('');
+        const productOptions = getProductSelectOptions(item.code || item.name);
         const tr = document.createElement('tr');
         tr.id = `pur-row-${rowId}`;
         tr.innerHTML = `
@@ -2506,6 +3047,9 @@ window.openEditPurchaseModal = (id) => {
             <td width="50"><button type="button" class="action-btn" onclick="removePurchaseRow('${rowId}')"><i class="fas fa-times"></i></button></td>
         `;
         tbody.appendChild(tr);
+        if (window.ModernDropdown && window.ModernDropdown.init) {
+            window.ModernDropdown.init(tr);
+        }
     });
 
     calculatePurchaseTotals();
@@ -2515,7 +3059,7 @@ window.openEditPurchaseModal = (id) => {
 window.addPurchaseItemRow = () => {
     const tbody = document.getElementById('pur-items-list');
     const rowId = Date.now() + Math.random();
-    const productOptions = state.inventory.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+    const productOptions = getProductSelectOptions();
     const tr = document.createElement('tr');
     tr.id = `pur-row-${rowId}`;
     tr.innerHTML = `
@@ -2523,11 +3067,14 @@ window.addPurchaseItemRow = () => {
         <td width="120"><input type="text" class="pur-item-hsn" placeholder="HSN/SAC"></td>
         <td width="100"><input type="number" class="pur-item-qty" value="1" min="1" oninput="calculatePurchaseTotals()" required></td>
         <td width="130"><input type="number" class="pur-item-cost" step="0.01" oninput="calculatePurchaseTotals()" required></td>
-        <td class="pur-item-tax-cell" width="110"><input type="number" class="pur-item-tax" data-total-tax="0" value="0" readonly></td>
+        <td class="item-tax-cell" width="110"><input type="number" class="pur-item-tax" data-total-tax="0" value="0" readonly></td>
         <td width="140"><input type="text" class="pur-item-total" readonly value="0.00"></td>
         <td width="50"><button type="button" class="action-btn" onclick="removePurchaseRow('${rowId}')"><i class="fas fa-times"></i></button></td>
     `;
     tbody.appendChild(tr);
+    if (window.ModernDropdown && window.ModernDropdown.init) {
+        window.ModernDropdown.init(tr);
+    }
     calculatePurchaseTotals();
 };
 
@@ -2553,7 +3100,17 @@ window.updatePurchaseRowDetails = (rowId) => {
 };
 
 window.calculatePurchaseTotals = () => {
-    const gstType = document.getElementById('pur-gst-type')?.value || 'Local';
+    const billType = document.getElementById('pur-bill-type')?.value || 'GST Bill';
+    const gstTypeSelect = document.getElementById('pur-gst-type');
+    const gstType = gstTypeSelect?.value || 'Local';
+    
+    if (gstTypeSelect) {
+        gstTypeSelect.disabled = (billType === 'Non-GST Bill');
+        if (window.ModernDropdown && window.ModernDropdown.sync) {
+            window.ModernDropdown.sync(gstTypeSelect);
+        }
+    }
+    
     const headerRow = document.querySelector('.pur-items-table thead tr');
     
     if (headerRow) {
@@ -2561,7 +3118,16 @@ window.calculatePurchaseTotals = () => {
         const existingSgstHeader = headerRow.querySelector('.pur-sgst-header');
         if (existingSgstHeader) existingSgstHeader.remove();
 
-        if (gstType === 'Local') {
+        if (billType === 'Non-GST Bill') {
+            headerRow.innerHTML = `
+                <th width="300">Product</th>
+                <th width="120">HSN/SAC</th>
+                <th width="100">Qty</th>
+                <th width="130">Cost Price</th>
+                <th width="140">Total</th>
+                <th width="50"></th>
+            `;
+        } else if (gstType === 'Local') {
             headerRow.innerHTML = `
                 <th width="300">Product</th>
                 <th width="120">HSN/SAC</th>
@@ -2591,17 +3157,29 @@ window.calculatePurchaseTotals = () => {
     rows.forEach(row => {
         const qty = parseFloat(row.querySelector('.pur-item-qty').value) || 0;
         const price = parseFloat(row.querySelector('.pur-item-cost').value) || 0;
-        const totalTaxRate = parseFloat(row.querySelector('.pur-item-tax').dataset.totalTax || 0);
+        let totalTaxRate = 0;
+        
+        if (billType === 'GST Bill') {
+            totalTaxRate = parseFloat(row.querySelector('.pur-item-tax')?.dataset?.totalTax || 0);
+        }
         
         const lineSubtotal = qty * price;
-        const lineTax = lineSubtotal * (totalTaxRate / 100);
+        const lineTax = billType === 'GST Bill' ? lineSubtotal * (totalTaxRate / 100) : 0;
         
-        if (gstType === 'Local') {
+        if (billType === 'Non-GST Bill') {
+            const taxCell = row.querySelector('.pur-item-tax-cell');
+            if (taxCell) taxCell.innerHTML = '';
+            const sgstCell = row.querySelector('.pur-item-tax-sgst-cell');
+            if (sgstCell) sgstCell.remove();
+        } else if (gstType === 'Local') {
             const halfTax = (totalTaxRate / 2).toFixed(2);
-            row.querySelector('.pur-item-tax-cell').innerHTML = `
-                <input type="number" class="pur-item-tax" data-total-tax="${totalTaxRate}" value="${halfTax}" readonly>
-            `;
-            if (!row.querySelector('.pur-item-tax-sgst')) {
+            const taxCell = row.querySelector('.pur-item-tax-cell');
+            if (taxCell) {
+                taxCell.innerHTML = `
+                    <input type="number" class="pur-item-tax" data-total-tax="${totalTaxRate}" value="${halfTax}" readonly>
+                `;
+            }
+            if (!row.querySelector('.pur-item-tax-sgst-cell')) {
                 const td = document.createElement('td');
                 td.className = 'pur-item-tax-sgst-cell';
                 td.innerHTML = `<input type="number" class="pur-item-tax-sgst" value="${halfTax}" readonly>`;
@@ -2610,9 +3188,12 @@ window.calculatePurchaseTotals = () => {
                 row.querySelector('.pur-item-tax-sgst').value = halfTax;
             }
         } else {
-            row.querySelector('.pur-item-tax-cell').innerHTML = `
-                <input type="number" class="pur-item-tax" data-total-tax="${totalTaxRate}" value="${totalTaxRate}" readonly>
-            `;
+            const taxCell = row.querySelector('.pur-item-tax-cell');
+            if (taxCell) {
+                taxCell.innerHTML = `
+                    <input type="number" class="pur-item-tax" data-total-tax="${totalTaxRate}" value="${totalTaxRate}" readonly>
+                `;
+            }
             const sgstCell = row.querySelector('.pur-item-tax-sgst-cell');
             if (sgstCell) sgstCell.remove();
         }
@@ -2623,9 +3204,16 @@ window.calculatePurchaseTotals = () => {
     });
 
     document.getElementById('pur-subtotal').textContent = `₹ ${subtotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-    const taxLabel = gstType === 'Local' ? 'CGST + SGST' : 'IGST';
-    document.getElementById('pur-tax-total').parentElement.firstChild.textContent = `${taxLabel} Total:`;
-    document.getElementById('pur-tax-total').textContent = `₹ ${taxTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+    
+    if (billType === 'Non-GST Bill') {
+        document.getElementById('pur-tax-total').parentElement.style.display = 'none';
+    } else {
+        document.getElementById('pur-tax-total').parentElement.style.display = 'block';
+        const taxLabel = gstType === 'Local' ? 'CGST + SGST' : 'IGST';
+        document.getElementById('pur-tax-total').parentElement.firstChild.textContent = `${taxLabel} Total:`;
+        document.getElementById('pur-tax-total').textContent = `₹ ${taxTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+    }
+
     const grandTotal = subtotal + taxTotal;
     document.getElementById('pur-grand-total').textContent = `₹ ${grandTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
     
@@ -2646,6 +3234,7 @@ async function handlePurchaseSubmit(e) {
         const supplierId = document.getElementById('pur-supplier').value;
         const supplier = state.suppliers.find(s => s.id == supplierId);
         const date = document.getElementById('pur-date').value;
+        const billType = document.getElementById('pur-bill-type').value;
         const gstType = document.getElementById('pur-gst-type').value;
         const paymentMode = document.getElementById('pur-payment-mode').value;
         const purchaseId = document.getElementById('pur-order-no').value || getNextPurchaseNumber();
@@ -2655,7 +3244,8 @@ async function handlePurchaseSubmit(e) {
             const productId = row.querySelector('.pur-item-product').value;
             const product = state.inventory.find(p => p.id == productId);
             const qty = parseInt(row.querySelector('.pur-item-qty').value);
-            const totalTaxRate = parseFloat(row.querySelector('.pur-item-tax').dataset.totalTax || 0);
+            const purTaxInput = row.querySelector('.pur-item-tax');
+            const totalTaxRate = purTaxInput ? parseFloat(purTaxInput.dataset.totalTax || 0) : 0;
 
             items.push({ 
                 name: product.name, 
@@ -2691,6 +3281,8 @@ async function handlePurchaseSubmit(e) {
         const paidAmount = parseFloat(document.getElementById('pur-paid-amount').value) || 0;
         const status = document.getElementById('pur-status').value;
         const pendingAmount = parseFloat(grandTotalRaw) - paidAmount;
+        const shipTo = document.getElementById('pur-ship-to') ? document.getElementById('pur-ship-to').value.trim() : '';
+        const shipToCustomerId = document.getElementById('pur-ship-to-select') ? document.getElementById('pur-ship-to-select').value : '';
 
         const newPurchase = { 
             _id: purchaseId,
@@ -2698,6 +3290,9 @@ async function handlePurchaseSubmit(e) {
             date, 
             supplier: supplier.name, 
             supplierObj: supplier,
+            shipTo,
+            shipToCustomerId,
+            billType,
             gstType,
             items, 
             subtotal: subtotalRaw,
@@ -2715,7 +3310,7 @@ async function handlePurchaseSubmit(e) {
         
         await saveAppState();
         if (e.target.dataset.action === 'generate') {
-            await generateInvoicePDF(purchaseId, date, supplier, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, 'Purchases', paymentMode);
+            await generateInvoicePDF(purchaseId, date, supplier, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, billType, 'Purchases', paymentMode, shipTo);
             showToast('Purchase added and bill printed successfully');
         } else {
             showToast('Purchase added successfully');
@@ -2741,6 +3336,7 @@ async function handlePurchaseUpdate(e) {
         const supplierId = document.getElementById('pur-supplier').value;
         const supplier = state.suppliers.find(s => s.id == supplierId);
         const date = document.getElementById('pur-date').value;
+        const billType = document.getElementById('pur-bill-type').value;
         const gstType = document.getElementById('pur-gst-type').value;
         const paymentMode = document.getElementById('pur-payment-mode').value;
         
@@ -2749,7 +3345,8 @@ async function handlePurchaseUpdate(e) {
             const productId = row.querySelector('.pur-item-product').value;
             const product = state.inventory.find(p => p.id == productId);
             const qty = parseInt(row.querySelector('.pur-item-qty').value);
-            const totalTaxRate = parseFloat(row.querySelector('.pur-item-tax').dataset.totalTax || 0);
+            const purTaxInput2 = row.querySelector('.pur-item-tax');
+            const totalTaxRate = purTaxInput2 ? parseFloat(purTaxInput2.dataset.totalTax || 0) : 0;
 
             items.push({ 
                 name: product.name, 
@@ -2789,6 +3386,8 @@ async function handlePurchaseUpdate(e) {
             const paidAmount = parseFloat(document.getElementById('pur-paid-amount').value) || 0;
             const status = document.getElementById('pur-status').value;
             const pendingAmount = parseFloat(grandTotalRaw) - paidAmount;
+            const shipTo = document.getElementById('pur-ship-to') ? document.getElementById('pur-ship-to').value.trim() : '';
+            const shipToCustomerId = document.getElementById('pur-ship-to-select') ? document.getElementById('pur-ship-to-select').value : '';
 
             let attachmentBase64 = oldPur.attachment; // Corrected: use oldPur instead of pur
             const fileInput = document.getElementById('pur-attachment');
@@ -2807,6 +3406,9 @@ async function handlePurchaseUpdate(e) {
                 date, 
                 supplier: supplier.name, 
                 supplierObj: supplier,
+                shipTo,
+                shipToCustomerId,
+                billType,
                 gstType,
                 items, 
                 subtotal: subtotalRaw, 
@@ -2825,7 +3427,7 @@ async function handlePurchaseUpdate(e) {
             
             await saveAppState();
             if (e.target.dataset.action === 'generate') {
-                await generateInvoicePDF(purchaseId, date, supplier, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, 'Purchases', paymentMode);
+                await generateInvoicePDF(purchaseId, date, supplier, items, subtotalRaw, taxRaw, grandTotalRaw, gstType, billType, 'Purchases', paymentMode, shipTo);
                 showToast(`Purchase ${purchaseId} updated and bill printed.`);
             } else {
                 showToast(`Purchase ${purchaseId} updated.`);
@@ -2847,7 +3449,7 @@ window.viewPurchase = async (id) => {
     if (!pur) return;
     
     if (pur.supplierObj && pur.items) {
-        await generateInvoicePDF(pur.id, pur.date, pur.supplierObj, pur.items, pur.subtotal, pur.tax, pur.total, pur.gstType || 'Local', 'Purchases', pur.paymentMode || '');
+        await generateInvoicePDF(pur.id, pur.date, pur.supplierObj, pur.items, pur.subtotal, pur.tax, pur.total, pur.gstType || 'Local', pur.billType || 'GST Bill', 'Purchases', pur.paymentMode || '', pur.shipTo || '');
         showToast('Bill re-generated');
     } else {
         showToast('Bill detail not available.', 'warning');
@@ -3266,19 +3868,39 @@ window.openAddExpenseModal = () => {
     const categoryOptions = state.expenseCategories.map(cat => `<option value="${cat}">${cat}</option>`).join('');
     const content = `
         <form id="expense-form">
-            <div class="form-group">
-                <label>Category</label>
-                <div style="display: flex; gap: 0.5rem;">
-                    <select id="exp-cat" style="flex: 1;">
-                        ${categoryOptions}
-                    </select>
-                    <button type="button" class="btn-secondary" style="width: 40px;" onclick="openAddCategoryModal()" title="Add Category"><i class="fas fa-plus"></i></button>
-                </div>
-            </div>
-            <div class="form-group"><label>Description</label><input type="text" id="exp-desc" required></div>
             <div class="form-row">
-                <div class="form-group"><label>Amount</label><input type="number" id="exp-amount" step="0.01" required></div>
+                <div class="form-group">
+                    <label>Category</label>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <select id="exp-cat" style="flex: 1;">
+                            ${categoryOptions}
+                        </select>
+                        <button type="button" class="btn-secondary" style="width: 40px;" onclick="openAddCategoryModal()" title="Add Category"><i class="fas fa-plus"></i></button>
+                    </div>
+                </div>
                 <div class="form-group"><label>Date</label><input type="date" id="exp-date" value="${new Date().toISOString().split('T')[0]}" required></div>
+            </div>
+            <div class="form-group"><label>Description</label><input type="text" id="exp-desc" placeholder="Expense description..." required></div>
+            <div class="form-row">
+                <div class="form-group"><label>Amount (₹)</label><input type="number" id="exp-amount" step="0.01" min="0" placeholder="0.00" required></div>
+                <div class="form-group"><label>Advance Given (₹)</label><input type="number" id="exp-advance" step="0.01" min="0" placeholder="0.00" value="0"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>Employee Name</label><input type="text" id="exp-employee" placeholder="Employee who made expense"></div>
+                <div class="form-group">
+                    <label>Payment Done By</label>
+                    <select id="exp-payment-by">
+                        <option value="">- Select -</option>
+                        <option value="Cash">Cash</option>
+                        <option value="UPI">UPI</option>
+                        <option value="Bank Transfer">Bank Transfer</option>
+                        <option value="Cheque">Cheque</option>
+                        <option value="Credit Card">Credit Card</option>
+                        <option value="Debit Card">Debit Card</option>
+                        <option value="Petty Cash">Petty Cash</option>
+                        <option value="Advance">From Advance</option>
+                    </select>
+                </div>
             </div>
             <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 1rem;">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
@@ -3296,6 +3918,9 @@ window.openAddExpenseModal = () => {
             category: document.getElementById('exp-cat').value,
             description: document.getElementById('exp-desc').value,
             amount: parseFloat(document.getElementById('exp-amount').value),
+            advance: parseFloat(document.getElementById('exp-advance').value) || 0,
+            employeeName: document.getElementById('exp-employee').value.trim(),
+            paymentBy: document.getElementById('exp-payment-by').value,
             date: document.getElementById('exp-date').value
         };
 
@@ -3319,22 +3944,38 @@ window.openEditExpenseModal = (id) => {
     if (!expense) return;
 
     const categoryOptions = state.expenseCategories.map(cat => `<option value="${cat}" ${cat === expense.category ? 'selected' : ''}>${cat}</option>`).join('');
+    const paymentOptions = ['', 'Cash', 'UPI', 'Bank Transfer', 'Cheque', 'Credit Card', 'Debit Card', 'Petty Cash', 'Advance'].map(opt =>
+        `<option value="${opt}" ${opt === (expense.paymentBy || '') ? 'selected' : ''}>${opt || '- Select -'}</option>`
+    ).join('');
+    
     const content = `
         <form id="edit-expense-form">
             <input type="hidden" id="edit-exp-id" value="${expense.id}">
-            <div class="form-group">
-                <label>Category</label>
-                <div style="display: flex; gap: 0.5rem;">
-                    <select id="edit-exp-cat" style="flex: 1;">
-                        ${categoryOptions}
-                    </select>
-                    <button type="button" class="btn-secondary" style="width: 40px;" onclick="openAddCategoryModal()" title="Add Category"><i class="fas fa-plus"></i></button>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Category</label>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <select id="edit-exp-cat" style="flex: 1;">
+                            ${categoryOptions}
+                        </select>
+                        <button type="button" class="btn-secondary" style="width: 40px;" onclick="openAddCategoryModal()" title="Add Category"><i class="fas fa-plus"></i></button>
+                    </div>
                 </div>
+                <div class="form-group"><label>Date</label><input type="date" id="edit-exp-date" value="${expense.date}" required></div>
             </div>
             <div class="form-group"><label>Description</label><input type="text" id="edit-exp-desc" value="${expense.description}" required></div>
             <div class="form-row">
-                <div class="form-group"><label>Amount</label><input type="number" id="edit-exp-amount" step="0.01" value="${expense.amount}" required></div>
-                <div class="form-group"><label>Date</label><input type="date" id="edit-exp-date" value="${expense.date}" required></div>
+                <div class="form-group"><label>Amount (₹)</label><input type="number" id="edit-exp-amount" step="0.01" min="0" value="${expense.amount}" required></div>
+                <div class="form-group"><label>Advance Given (₹)</label><input type="number" id="edit-exp-advance" step="0.01" min="0" value="${expense.advance || 0}"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>Employee Name</label><input type="text" id="edit-exp-employee" value="${expense.employeeName || ''}" placeholder="Employee who made expense"></div>
+                <div class="form-group">
+                    <label>Payment Done By</label>
+                    <select id="edit-exp-payment-by">
+                        ${paymentOptions}
+                    </select>
+                </div>
             </div>
             <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 1rem;">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
@@ -3353,6 +3994,9 @@ async function handleExpenseUpdate(e) {
         category: document.getElementById('edit-exp-cat').value,
         description: document.getElementById('edit-exp-desc').value,
         amount: parseFloat(document.getElementById('edit-exp-amount').value),
+        advance: parseFloat(document.getElementById('edit-exp-advance').value) || 0,
+        employeeName: document.getElementById('edit-exp-employee').value.trim(),
+        paymentBy: document.getElementById('edit-exp-payment-by').value,
         date: document.getElementById('edit-exp-date').value
     };
 
@@ -3390,6 +4034,396 @@ window.deleteExpense = async (id) => {
             console.error('Error deleting expense:', err);
             showToast('Failed to delete expense', 'error');
         }
+    }
+};
+
+// ─── Expenses Excel Export ────────────────────────────────────────
+window.exportExpensesExcel = () => {
+    try {
+        if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+        
+        const data = state.expenses;
+        if (data.length === 0) { showToast('No expenses to export', 'warning'); return; }
+
+        const rows = data.map(e => ({
+            'Date': e.date || '',
+            'Category': e.category || '',
+            'Description': e.description || '',
+            'Employee Name': e.employeeName || '',
+            'Payment Done By': e.paymentBy || '',
+            'Advance Given (₹)': parseFloat(e.advance) || 0,
+            'Amount (₹)': parseFloat(e.amount) || 0
+        }));
+
+        const ws = XLSX.utils.json_to_sheet(rows);
+        // Set column widths
+        ws['!cols'] = [
+            { wch: 14 }, { wch: 18 }, { wch: 30 }, { wch: 22 }, { wch: 18 }, { wch: 18 }, { wch: 14 }
+        ];
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Expenses');
+        XLSX.writeFile(wb, `Expenses_${new Date().toISOString().split('T')[0]}.xlsx`);
+        showToast('Expenses exported to Excel successfully');
+    } catch (err) {
+        console.error('Export error:', err);
+        showToast('Failed to export expenses', 'error');
+    }
+};
+
+// Triggers the hidden file input
+window.importExpensesExcel = () => {
+    const input = document.getElementById('expense-excel-import');
+    if (input) { input.value = ''; input.click(); }
+};
+
+// Handles the file once selected
+window.handleExpenseExcelImport = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+
+    try {
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const data = new Uint8Array(e.target.result);
+                const wb = XLSX.read(data, { type: 'array' });
+                const ws = wb.Sheets[wb.SheetNames[0]];
+                const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+                if (rows.length === 0) { showToast('No data found in file', 'warning'); return; }
+
+                let imported = 0;
+                let skipped = 0;
+                for (const row of rows) {
+                    // Support flexible column name casing
+                    const amount = parseFloat(row['Amount (₹)'] || row['Amount'] || row['amount'] || 0);
+                    if (!amount) { skipped++; continue; }
+
+                    const id = Date.now().toString() + Math.random().toString(36).slice(2);
+                    const newExpense = {
+                        _id: id,
+                        id,
+                        date: row['Date'] || row['date'] || new Date().toISOString().split('T')[0],
+                        category: row['Category'] || row['category'] || 'Others',
+                        description: row['Description'] || row['description'] || '',
+                        employeeName: row['Employee Name'] || row['employeeName'] || '',
+                        paymentBy: row['Payment Done By'] || row['paymentBy'] || '',
+                        advance: parseFloat(row['Advance Given (₹)'] || row['Advance'] || row['advance'] || 0),
+                        amount
+                    };
+
+                    try {
+                        await db.expenses.put(newExpense);
+                        state.expenses.unshift(newExpense);
+                        imported++;
+                    } catch (putErr) {
+                        if (putErr.status !== 409) console.error('Import row error:', putErr);
+                        skipped++;
+                    }
+                }
+
+                await saveAppState();
+                applyModuleFilters('exp');
+                updateDashboardStats();
+                showToast(`Import complete: ${imported} records added${skipped > 0 ? `, ${skipped} skipped` : ''}`);
+            } catch (parseErr) {
+                console.error('Excel parse error:', parseErr);
+                showToast('Failed to parse Excel file', 'error');
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    } catch (err) {
+        console.error('Import error:', err);
+        showToast('Failed to import file', 'error');
+    }
+};
+
+// ─── Inventory Excel Export ──────────────────────────────────────
+window.exportInventoryToExcel = () => {
+    try {
+        if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+        const data = state.inventory;
+        if (data.length === 0) { showToast('No products to export', 'warning'); return; }
+
+        const rows = data.map(p => ({
+            'Product Name': p.name || '',
+            'SKU': p.sku || '',
+            'Category': p.category || '',
+            'Price (₹)': parseFloat(p.price) || 0,
+            'Stock': parseFloat(p.stock) || 0,
+            'Min Stock': parseFloat(p.minStock) || 0,
+            'Tax Rate %': parseFloat(p.taxRate) || 0,
+            'HSN/SAC Code': p.hsn || ''
+        }));
+
+        const ws = XLSX.utils.json_to_sheet(rows);
+        ws['!cols'] = [{ wch: 22 }, { wch: 14 }, { wch: 18 }, { wch: 12 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 16 }];
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Inventory');
+        XLSX.writeFile(wb, `Inventory_${new Date().toISOString().split('T')[0]}.xlsx`);
+        showToast('Inventory exported to Excel successfully');
+    } catch (err) {
+        console.error('Export error:', err);
+        showToast('Failed to export inventory', 'error');
+    }
+};
+
+// Triggers the hidden file input
+window.importInventoryExcel = () => {
+    const input = document.getElementById('inventory-excel-import');
+    if (input) { input.value = ''; input.click(); }
+};
+
+// Handles the file once selected
+window.handleInventoryExcelImport = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+
+    try {
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const data = new Uint8Array(e.target.result);
+                const wb = XLSX.read(data, { type: 'array' });
+                const ws = wb.Sheets[wb.SheetNames[0]];
+                const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+                if (rows.length === 0) { showToast('No data found in file', 'warning'); return; }
+
+                let imported = 0;
+                let skipped = 0;
+                for (const row of rows) {
+                    const name = row['Product Name'] || row['name'] || row['Product'];
+                    const sku = row['SKU'] || row['sku'] || row['Sku'];
+                    if (!name || !sku) { skipped++; continue; }
+
+                    const id = Date.now().toString() + Math.random().toString(36).slice(2);
+                    const newItem = {
+                        _id: id,
+                        id,
+                        name,
+                        sku,
+                        category: row['Category'] || row['category'] || 'General',
+                        price: parseFloat(row['Price (₹)'] || row['Price'] || row['price'] || 0),
+                        stock: parseFloat(row['Stock'] || row['stock'] || 0),
+                        minStock: parseFloat(row['Min Stock'] || row['minStock'] || row['Minimum Stock'] || 0),
+                        taxRate: parseFloat(row['Tax Rate %'] || row['taxRate'] || row['Tax'] || 0),
+                        hsn: row['HSN/SAC Code'] || row['hsn'] || ''
+                    };
+
+                    try {
+                        await db.inventory.put(newItem);
+                        state.inventory.unshift(newItem);
+                        imported++;
+                    } catch (putErr) {
+                        if (putErr.status !== 409) console.error('Import row error:', putErr);
+                        skipped++;
+                    }
+                }
+
+                await saveAppState();
+                renderInventory();
+                updateDashboardStats();
+                showToast(`Import complete: ${imported} products added${skipped > 0 ? `, ${skipped} skipped` : ''}`);
+            } catch (parseErr) {
+                console.error('Excel parse error:', parseErr);
+                showToast('Failed to parse Excel file', 'error');
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    } catch (err) {
+        console.error('Import error:', err);
+        showToast('Failed to import file', 'error');
+    }
+};
+
+// ─── Customers Excel Export ────────────────────────────────────────
+window.exportCustomersToExcel = () => {
+    try {
+        if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+        const data = state.customers;
+        if (data.length === 0) { showToast('No customers to export', 'warning'); return; }
+
+        const rows = data.map(c => ({
+            'Name': c.name || '',
+            'GSTIN': c.gstin || '',
+            'State': c.state || '',
+            'Phone': c.phone || '',
+            'Email': c.email || '',
+            'Address': c.address || ''
+        }));
+
+        const ws = XLSX.utils.json_to_sheet(rows);
+        ws['!cols'] = [{ wch: 22 }, { wch: 18 }, { wch: 16 }, { wch: 16 }, { wch: 26 }, { wch: 30 }];
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Customers');
+        XLSX.writeFile(wb, `Customers_${new Date().toISOString().split('T')[0]}.xlsx`);
+        showToast('Customers exported to Excel successfully');
+    } catch (err) {
+        console.error('Export error:', err);
+        showToast('Failed to export customers', 'error');
+    }
+};
+
+// Triggers the hidden file input
+window.importCustomersExcel = () => {
+    const input = document.getElementById('customers-excel-import');
+    if (input) { input.value = ''; input.click(); }
+};
+
+// Handles the file once selected
+window.handleCustomersExcelImport = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+
+    try {
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const data = new Uint8Array(e.target.result);
+                const wb = XLSX.read(data, { type: 'array' });
+                const ws = wb.Sheets[wb.SheetNames[0]];
+                const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+                if (rows.length === 0) { showToast('No data found in file', 'warning'); return; }
+
+                let imported = 0;
+                let skipped = 0;
+                for (const row of rows) {
+                    const name = row['Name'] || row['name'] || row['Full Name'] || row['Customer'];
+                    if (!name) { skipped++; continue; }
+
+                    const id = Date.now().toString() + Math.random().toString(36).slice(2);
+                    const newCustomer = {
+                        _id: id,
+                        id,
+                        name,
+                        gstin: row['GSTIN'] || row['gstin'] || '',
+                        state: row['State'] || row['state'] || '',
+                        email: row['Email'] || row['email'] || '',
+                        phone: row['Phone'] || row['phone'] || '',
+                        address: row['Address'] || row['address'] || ''
+                    };
+
+                    try {
+                        await db.customers.put(newCustomer);
+                        state.customers.unshift(newCustomer);
+                        imported++;
+                    } catch (putErr) {
+                        if (putErr.status !== 409) console.error('Import row error:', putErr);
+                        skipped++;
+                    }
+                }
+
+                await saveAppState();
+                renderCustomers();
+                showToast(`Import complete: ${imported} customers added${skipped > 0 ? `, ${skipped} skipped` : ''}`);
+            } catch (parseErr) {
+                console.error('Excel parse error:', parseErr);
+                showToast('Failed to parse Excel file', 'error');
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    } catch (err) {
+        console.error('Import error:', err);
+        showToast('Failed to import file', 'error');
+    }
+};
+
+// ─── Suppliers Excel Export ────────────────────────────────────────
+window.exportSuppliersToExcel = () => {
+    try {
+        if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+        const data = state.suppliers;
+        if (data.length === 0) { showToast('No suppliers to export', 'warning'); return; }
+
+        const rows = data.map(s => ({
+            'Name': s.name || '',
+            'GSTIN': s.gstin || '',
+            'State': s.state || '',
+            'Phone': s.phone || '',
+            'Email': s.email || '',
+            'Address': s.address || ''
+        }));
+
+        const ws = XLSX.utils.json_to_sheet(rows);
+        ws['!cols'] = [{ wch: 22 }, { wch: 18 }, { wch: 16 }, { wch: 16 }, { wch: 26 }, { wch: 30 }];
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Suppliers');
+        XLSX.writeFile(wb, `Suppliers_${new Date().toISOString().split('T')[0]}.xlsx`);
+        showToast('Suppliers exported to Excel successfully');
+    } catch (err) {
+        console.error('Export error:', err);
+        showToast('Failed to export suppliers', 'error');
+    }
+};
+
+// Triggers the hidden file input
+window.importSuppliersExcel = () => {
+    const input = document.getElementById('suppliers-excel-import');
+    if (input) { input.value = ''; input.click(); }
+};
+
+// Handles the file once selected
+window.handleSuppliersExcelImport = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (!window.XLSX) { showToast('Excel library not loaded', 'error'); return; }
+
+    try {
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const data = new Uint8Array(e.target.result);
+                const wb = XLSX.read(data, { type: 'array' });
+                const ws = wb.Sheets[wb.SheetNames[0]];
+                const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+                if (rows.length === 0) { showToast('No data found in file', 'warning'); return; }
+
+                let imported = 0;
+                let skipped = 0;
+                for (const row of rows) {
+                    const name = row['Name'] || row['name'] || row['Supplier Name'] || row['Supplier'];
+                    if (!name) { skipped++; continue; }
+
+                    const id = Date.now().toString() + Math.random().toString(36).slice(2);
+                    const newSupplier = {
+                        _id: id,
+                        id,
+                        name,
+                        gstin: row['GSTIN'] || row['gstin'] || '',
+                        state: row['State'] || row['state'] || '',
+                        email: row['Email'] || row['email'] || '',
+                        phone: row['Phone'] || row['phone'] || '',
+                        address: row['Address'] || row['address'] || ''
+                    };
+
+                    try {
+                        await db.suppliers.put(newSupplier);
+                        state.suppliers.unshift(newSupplier);
+                        imported++;
+                    } catch (putErr) {
+                        if (putErr.status !== 409) console.error('Import row error:', putErr);
+                        skipped++;
+                    }
+                }
+
+                await saveAppState();
+                renderSuppliers();
+                showToast(`Import complete: ${imported} suppliers added${skipped > 0 ? `, ${skipped} skipped` : ''}`);
+            } catch (parseErr) {
+                console.error('Excel parse error:', parseErr);
+                showToast('Failed to parse Excel file', 'error');
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    } catch (err) {
+        console.error('Import error:', err);
+        showToast('Failed to import file', 'error');
     }
 };
 
@@ -3564,6 +4598,7 @@ function renderUsers() {
             <td><span class="status-pill ${u.role === 'Admin' ? 'status-paid' : 'status-pending'}">${u.role}</span></td>
             <td>${u.lastLogin || 'Never'}</td>
             <td>
+                <button class="action-btn" onclick="openResetUserPasswordModal('${u.id}')" title="Set / Reset Password"><i class="fas fa-key"></i></button>
                 <button class="action-btn" onclick="openEditUserModal('${u.id}')"><i class="fas fa-edit"></i></button>
                 <button class="action-btn" onclick="deleteUser('${u.id}')" ${u.role === 'Admin' ? 'disabled' : ''}><i class="fas fa-trash"></i></button>
             </td>
@@ -3609,51 +4644,23 @@ window.openAddUserModal = () => {
         setBtnLoading(submitBtn, true, originalText);
         
         try {
-            if (supabaseClient) {
-                const { data, error } = await supabaseClient.auth.signUp({ 
-                    email, 
-                    password,
-                    options: {
-                        data: { role: role }
-                    }
-                });
-                
-                if (error) throw error;
-                
-                if (data.user) {
-                    const { error: profErr } = await supabaseClient
-                        .from('profiles')
-                        .upsert([{ 
-                            id: data.user.id, 
-                            email, 
-                            role
-                        }]);
-                    
-                    if (profErr) throw profErr;
-                    showToast(`User ${email} created! If login fails, please check if email confirmation is enabled in Supabase settings.`);
-                } else if (data.session === null) {
-                    // This often happens if email confirmation is enabled or user exists
-                    showToast(`Creation request sent for ${email}. If they don't appear, they might already exist or need email confirmation.`, 'warning');
-                }
-            } else {
-                // Mock Mode: Add to local state and PouchDB
-                const id = Date.now().toString();
-                const newUser = {
-                    _id: id,
-                    id: id,
-                    email,
-                    role,
-                    lastLogin: 'Never'
-                };
-                try {
-                    await db.users.put(newUser);
-                    state.users.push(newUser);
-                    await saveAppState();
-                    showToast(`User ${email} created (Mock Mode)`);
-                } catch (err) {
-                    console.error('Error creating user in mock mode:', err);
-                    showToast('Failed to create user', 'error');
-                }
+            const id = Date.now().toString();
+            const newUser = {
+                _id: id,
+                id: id,
+                email,
+                role,
+                password,
+                lastLogin: 'Never'
+            };
+            try {
+                await db.users.put(newUser);
+                state.users.push(newUser);
+                await saveAppState();
+                showToast(`User ${email} created successfully!`);
+            } catch (err) {
+                console.error('Error creating user:', err);
+                showToast('Failed to create user', 'error');
             }
             
             await fetchUsers();
@@ -3678,32 +4685,20 @@ window.deleteUser = async (id) => {
         return;
     }
 
-    if (confirm('Are you sure you want to delete this user profile? (Note: This only deletes the profile record, not the Auth account for security)')) {
+    if (confirm('Are you sure you want to delete this user?')) {
         try {
-            console.log('Attempting to delete user with ID:', id);
-            
-            if (supabaseClient) {
-                const { error } = await supabaseClient
-                    .from('profiles')
-                    .delete()
-                    .eq('id', id);
-                
-                if (error) throw error;
-            } else {
-                // Mock Mode delete from PouchDB
-                try {
-                    const doc = await db.users.get(id.toString());
-                    await db.users.remove(doc);
-                } catch (pouchErr) {
-                    if (pouchErr.status !== 404) throw pouchErr;
-                }
+            try {
+                const doc = await db.users.get(id.toString());
+                await db.users.remove(doc);
+            } catch (pouchErr) {
+                if (pouchErr.status !== 404) throw pouchErr;
             }
 
             // Update UI State
             state.users = state.users.filter(u => u.id != id);
             await saveAppState();
             renderUsers();
-            showToast('User profile deleted successfully');
+            showToast('User deleted successfully');
         } catch (err) {
             console.error('Delete user error:', err);
             showToast(`Error: ${err.message || 'Operation failed'}`, 'error');
@@ -3715,38 +4710,45 @@ window.openForgotPasswordModal = () => {
     const content = `
         <form id="forgot-password-form">
             <div class="form-group">
-                <label>Enter your email address</label>
-                <input type="email" id="forgot-email" required placeholder="you@example.com">
+                <label>Enter your registered email</label>
+                <input type="email" id="forgot-email" required placeholder="e.g. admin@manager.io">
             </div>
-            <p>We will send a password reset link to your email.</p>
+            <div class="form-group">
+                <label>New Password</label>
+                <input type="password" id="forgot-new-password" required minlength="4" placeholder="Enter new password">
+            </div>
             <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 1rem;">
                 <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
-                <button type="submit" class="btn-primary" style="width: auto;">Send Reset Link</button>
+                <button type="submit" class="btn-primary" style="width: auto;">Reset Password</button>
             </div>
         </form>
     `;
-    openModal('Forgot Password', content);
+    openModal('Reset Password', content);
 
     document.getElementById('forgot-password-form').onsubmit = async (e) => {
         e.preventDefault();
-        const email = document.getElementById('forgot-email').value;
+        const email = document.getElementById('forgot-email').value.trim();
+        const newPassword = document.getElementById('forgot-new-password').value;
         const submitBtn = e.target.querySelector('button[type="submit"]');
         const originalText = submitBtn.innerHTML;
 
         setBtnLoading(submitBtn, true, originalText);
-        
-        if (supabaseClient) {
-            const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
-                redirectTo: window.location.href,
-            });
-            if (error) {
-                showToast(`Error: ${error.message}`, 'error');
-            } else {
-                closeModal();
-                showToast('Password reset link sent! Check your email.');
+        const user = state.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+        if (user) {
+            user.password = newPassword;
+            try {
+                const doc = await db.users.get(user._id || user.id.toString());
+                await db.users.put({ ...doc, password: newPassword });
+            } catch (pErr) {
+                if (pErr.status === 404) {
+                    await db.users.put({ _id: user.id.toString(), id: user.id, email: user.email, role: user.role, password: newPassword });
+                }
             }
+            await saveAppState();
+            closeModal();
+            showToast('Password reset successfully! You can now log in.');
         } else {
-            showToast('Forgot Password is not available in Mock Mode.', 'warning');
+            showToast('No user found with that email address.', 'error');
         }
         setBtnLoading(submitBtn, false, originalText);
     };
@@ -3789,30 +4791,22 @@ window.openEditUserModal = (id) => {
         setBtnLoading(submitBtn, true, originalText);
         
         try {
-            if (supabaseClient) {
-                const { error } = await supabaseClient
-                    .from('profiles')
-                    .update({ 
-                        role
-                    })
-                    .eq('id', id);
-                
-                if (error) throw error;
-                
-                // Optimistic UI update
-                const idx = state.users.findIndex(u => u.id == id);
-                if (idx !== -1) {
-                    state.users[idx].role = role;
-                }
-            } else {
-                // Mock Mode: update in PouchDB
+            try {
                 const doc = await db.users.get(id.toString());
                 await db.users.put({ ...doc, role });
-                user.role = role;
+            } catch (pErr) {
+                if (pErr.status === 404) {
+                    await db.users.put({ _id: id.toString(), id, email: user.email, role });
+                }
+            }
+            user.role = role;
+            const idx = state.users.findIndex(u => u.id == id);
+            if (idx !== -1) {
+                state.users[idx].role = role;
             }
             
             showToast('User role updated successfully');
-            renderUsers(); // Refresh the list view
+            renderUsers();
             closeModal();
         } catch (err) {
             console.error('Update role error:', err);
@@ -3823,7 +4817,83 @@ window.openEditUserModal = (id) => {
     };
 };
 
+window.openResetUserPasswordModal = (id) => {
+    const user = state.users.find(u => u.id == id);
+    if (!user) {
+        showToast('User not found', 'error');
+        return;
+    }
+    const content = `
+        <form id="reset-password-form">
+            <div class="form-group">
+                <label>User</label>
+                <input type="text" value="${user.email}" readonly>
+            </div>
+            <div class="form-group">
+                <label>New Password</label>
+                <input type="password" id="reset-user-password" required minlength="4" placeholder="Minimum 4 characters">
+            </div>
+            <div class="form-group">
+                <label>Confirm New Password</label>
+                <input type="password" id="reset-user-password-confirm" required minlength="4" placeholder="Re-enter new password">
+            </div>
+            <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 1rem;">
+                <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
+                <button type="submit" class="btn-primary" style="width: auto;">Update Password</button>
+            </div>
+        </form>
+    `;
+    openModal('Set / Reset Password', content);
+
+    document.getElementById('reset-password-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const password = document.getElementById('reset-user-password').value;
+        const confirmPassword = document.getElementById('reset-user-password-confirm').value;
+        const submitBtn = e.target.querySelector('button[type="submit"]');
+        const originalText = submitBtn.innerHTML;
+
+        if (password !== confirmPassword) {
+            showToast('Passwords do not match', 'error');
+            return;
+        }
+        if (password.length < 4) {
+            showToast('Password must be at least 4 characters', 'error');
+            return;
+        }
+
+        setBtnLoading(submitBtn, true, originalText);
+        try {
+            try {
+                let doc = await db.users.get(id.toString());
+                await db.users.put({ ...doc, password });
+            } catch (pouchErr) {
+                if (pouchErr.status === 404) {
+                    await db.users.put({ _id: id.toString(), id, email: user.email, role: user.role, password });
+                } else {
+                    throw pouchErr;
+                }
+            }
+            user.password = password;
+            await saveAppState();
+            showToast(`Password updated for ${user.email}`);
+            closeModal();
+        } catch (err) {
+            console.error('Password update error:', err);
+            showToast(`Error: ${err.message || 'Operation failed'}`, 'error');
+        } finally {
+            setBtnLoading(submitBtn, false, originalText);
+        }
+    };
+};
+
 // Profile Module Implementation
+let profileStaging = {
+    logoUrl: null,
+    qrUrl: null,
+    sigUrl: null,
+    pendingFiles: {}
+};
+
 function renderProfileForm() {
     const comp = state.company;
     document.getElementById('prof-name').value = comp.name || '';
@@ -3832,34 +4902,95 @@ function renderProfileForm() {
     document.getElementById('prof-address').value = comp.address || '';
     document.getElementById('prof-phone').value = comp.phone || '';
     document.getElementById('prof-email').value = comp.email || '';
+    document.getElementById('prof-website').value = comp.website || '';
     document.getElementById('prof-state').value = comp.state || '';
     document.getElementById('prof-bank-name').value = comp.bankName || '';
+    document.getElementById('prof-branch-address').value = comp.branchAddress || '';
     document.getElementById('prof-account-no').value = comp.accountNo || '';
     document.getElementById('prof-ifsc').value = comp.ifscCode || '';
     document.getElementById('prof-holder').value = comp.accountHolder || '';
     document.getElementById('prof-terms').value = comp.terms || '';
 
-    const logoPreview = document.getElementById('prof-logo-preview');
-    const qrPreview = document.getElementById('prof-qr-preview');
-    const sigPreview = document.getElementById('prof-sig-preview');
+    // Initialize staging with current saved company images
+    profileStaging = {
+        logoUrl: comp.logoUrl || null,
+        qrUrl: comp.qrUrl || null,
+        sigUrl: comp.sigUrl || null,
+        pendingFiles: {}
+    };
 
-    logoPreview.src = comp.logoUrl || '';
-    logoPreview.style.display = comp.logoUrl ? 'block' : 'none';
-    
-    qrPreview.src = comp.qrUrl || '';
-    qrPreview.style.display = comp.qrUrl ? 'block' : 'none';
-    
-    sigPreview.src = comp.sigUrl || '';
-    sigPreview.style.display = comp.sigUrl ? 'block' : 'none';
+    // Reset file input values
+    const logoFileInput = document.getElementById('prof-logo-file');
+    const qrFileInput = document.getElementById('prof-qr-file');
+    const sigFileInput = document.getElementById('prof-sig-file');
+    if (logoFileInput) logoFileInput.value = '';
+    if (qrFileInput) qrFileInput.value = '';
+    if (sigFileInput) sigFileInput.value = '';
 
-    document.getElementById('prof-logo-file').onchange = (e) => handleFileChange(e, 'logoUrl', 'prof-logo-preview');
-    document.getElementById('prof-qr-file').onchange = (e) => handleFileChange(e, 'qrUrl', 'prof-qr-preview');
-    document.getElementById('prof-sig-file').onchange = (e) => handleFileChange(e, 'sigUrl', 'prof-sig-preview');
+    updateImagePreviews();
+
+    if (logoFileInput) logoFileInput.onchange = (e) => handleFileChange(e, 'logoUrl', 'prof-logo-preview', 'prof-logo-delete-btn');
+    if (qrFileInput) qrFileInput.onchange = (e) => handleFileChange(e, 'qrUrl', 'prof-qr-preview', 'prof-qr-delete-btn');
+    if (sigFileInput) sigFileInput.onchange = (e) => handleFileChange(e, 'sigUrl', 'prof-sig-preview', 'prof-sig-delete-btn');
 
     document.getElementById('profile-form').onsubmit = handleProfileSubmit;
 }
 
-async function handleFileChange(event, stateKey, previewId) {
+function updateImagePreviews() {
+    const logoPreview = document.getElementById('prof-logo-preview');
+    const qrPreview = document.getElementById('prof-qr-preview');
+    const sigPreview = document.getElementById('prof-sig-preview');
+
+    const logoDeleteBtn = document.getElementById('prof-logo-delete-btn');
+    const qrDeleteBtn = document.getElementById('prof-qr-delete-btn');
+    const sigDeleteBtn = document.getElementById('prof-sig-delete-btn');
+
+    if (logoPreview) {
+        logoPreview.src = profileStaging.logoUrl || '';
+        logoPreview.style.display = profileStaging.logoUrl ? 'block' : 'none';
+    }
+    if (logoDeleteBtn) {
+        logoDeleteBtn.style.display = profileStaging.logoUrl ? 'inline-flex' : 'none';
+    }
+
+    if (qrPreview) {
+        qrPreview.src = profileStaging.qrUrl || '';
+        qrPreview.style.display = profileStaging.qrUrl ? 'block' : 'none';
+    }
+    if (qrDeleteBtn) {
+        qrDeleteBtn.style.display = profileStaging.qrUrl ? 'inline-flex' : 'none';
+    }
+
+    if (sigPreview) {
+        sigPreview.src = profileStaging.sigUrl || '';
+        sigPreview.style.display = profileStaging.sigUrl ? 'block' : 'none';
+    }
+    if (sigDeleteBtn) {
+        sigDeleteBtn.style.display = profileStaging.sigUrl ? 'inline-flex' : 'none';
+    }
+}
+
+window.deleteCompanyImage = (stateKey, displayName) => {
+    // Only update staging in memory — DO NOT persist to database until "Save Profile Details" is clicked!
+    profileStaging[stateKey] = null;
+    delete profileStaging.pendingFiles[stateKey];
+
+    const fileInputMap = {
+        logoUrl: 'prof-logo-file',
+        qrUrl: 'prof-qr-file',
+        sigUrl: 'prof-sig-file'
+    };
+    const inputId = fileInputMap[stateKey];
+    if (inputId) {
+        const inputEl = document.getElementById(inputId);
+        if (inputEl) inputEl.value = '';
+    }
+
+    updateImagePreviews();
+    showToast(`${displayName} marked for removal. Click 'Save Profile Details' to apply changes.`);
+};
+
+async function handleFileChange(event, stateKey, previewId, deleteBtnId) {
     const file = event.target.files[0];
     if (!file) return;
 
@@ -3867,110 +4998,71 @@ async function handleFileChange(event, stateKey, previewId) {
     const validTypes = ['image/png', 'image/jpeg', 'image/jpg'];
     if (!validTypes.includes(file.type)) {
         showToast('Invalid file format. Please upload PNG or JPG only.', 'error');
-        event.target.value = ''; // Reset input
+        event.target.value = '';
         return;
     }
 
-    // 1. Immediate Feedback: Show local preview and update state with Data URL
+    // Read and stage local preview — DO NOT save to database yet!
     const reader = new FileReader();
-    reader.onload = async (e) => {
+    reader.onload = (e) => {
         const dataUrl = e.target.result;
-        
-        // Update UI preview
-        const preview = document.getElementById(previewId);
-        if (preview) {
-            preview.src = dataUrl;
-            preview.style.display = 'block';
-        }
-
-        // Update state immediately with Data URL (fallback/temp)
-        state.company[stateKey] = dataUrl;
-        
-        // Save to PouchDB
-        try {
-            const doc = await db.company.get('config');
-            await db.company.put({ ...doc, [stateKey]: dataUrl });
-        } catch (e) {
-            if (e.status === 404) {
-                await db.company.put({ ...state.company, _id: 'config', [stateKey]: dataUrl });
-            }
-        }
-        
-        await saveAppState();
-
-        // 2. Background Task: Upload to Supabase Storage if available
-        if (supabaseClient) {
-            try {
-                const fileExt = file.name.split('.').pop();
-                const fileName = `${stateKey}-${Date.now()}.${fileExt}`;
-                const filePath = `uploads/${fileName}`;
-
-                showToast(`Uploading ${stateKey} to cloud...`, 'info');
-
-                const { data, error } = await supabaseClient.storage
-                    .from('branding')
-                    .upload(filePath, file);
-
-                if (error) throw error;
-
-                // Get Public URL and update state with the permanent link
-                const { data: { publicUrl } } = supabaseClient.storage
-                    .from('branding')
-                    .getPublicUrl(filePath);
-
-                state.company[stateKey] = publicUrl;
-                
-                // Update PouchDB with public URL
-                const doc = await db.company.get('config');
-                await db.company.put({ ...doc, [stateKey]: publicUrl });
-                
-                await saveAppState();
-                showToast(`${stateKey} synced to cloud!`);
-            } catch (err) {
-                console.error('Cloud upload error:', err);
-                showToast(`Cloud sync failed: ${err.message}. Image saved locally.`, 'warning');
-                // State already has the Data URL from step 1, so we are safe.
-            }
-        }
+        profileStaging[stateKey] = dataUrl;
+        profileStaging.pendingFiles[stateKey] = file;
+        updateImagePreviews();
+        showToast('Image selected. Click \'Save Profile Details\' to apply changes.');
     };
     reader.readAsDataURL(file);
 }
 
 async function handleProfileSubmit(e) {
     e.preventDefault();
-    state.company.name = document.getElementById('prof-name').value;
-    state.company.legalName = document.getElementById('prof-legal-name').value;
-    state.company.gstin = document.getElementById('prof-gstin').value;
-    state.company.address = document.getElementById('prof-address').value;
-    state.company.phone = document.getElementById('prof-phone').value;
-    state.company.email = document.getElementById('prof-email').value;
-    state.company.state = document.getElementById('prof-state').value;
-    state.company.bankName = document.getElementById('prof-bank-name').value;
-    state.company.accountNo = document.getElementById('prof-account-no').value;
-    state.company.ifscCode = document.getElementById('prof-ifsc').value;
-    state.company.accountHolder = document.getElementById('prof-holder').value;
-    state.company.terms = document.getElementById('prof-terms').value;
-    
-    // Save to PouchDB
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    const originalText = submitBtn ? submitBtn.innerHTML : '';
+    if (submitBtn) setBtnLoading(submitBtn, true, 'Saving...');
+
     try {
+        state.company.name = document.getElementById('prof-name').value.trim();
+        state.company.legalName = document.getElementById('prof-legal-name').value.trim();
+        state.company.gstin = document.getElementById('prof-gstin').value.trim();
+        state.company.address = document.getElementById('prof-address').value.trim();
+        state.company.phone = document.getElementById('prof-phone').value.trim();
+        state.company.email = document.getElementById('prof-email').value.trim();
+        state.company.website = document.getElementById('prof-website').value.trim();
+        state.company.state = document.getElementById('prof-state').value.trim();
+        state.company.bankName = document.getElementById('prof-bank-name').value.trim();
+        state.company.branchAddress = document.getElementById('prof-branch-address').value.trim();
+        state.company.accountNo = document.getElementById('prof-account-no').value.trim();
+        state.company.ifscCode = document.getElementById('prof-ifsc').value.trim();
+        state.company.accountHolder = document.getElementById('prof-holder').value.trim();
+        state.company.terms = document.getElementById('prof-terms').value.trim();
+
+        // Apply staged images to state.company now
+        state.company.logoUrl = profileStaging.logoUrl;
+        state.company.qrUrl = profileStaging.qrUrl;
+        state.company.sigUrl = profileStaging.sigUrl;
+
+        // Save to PouchDB
         let doc;
         try {
             doc = await db.company.get('config');
             await db.company.put({ ...doc, ...state.company });
-        } catch (e) {
-            if (e.status === 404) {
+        } catch (pouchErr) {
+            if (pouchErr.status === 404) {
                 await db.company.put({ ...state.company, _id: 'config' });
             } else {
-                throw e;
+                throw pouchErr;
             }
         }
-        
+
         await saveAppState(); // Updates UI
         updateBrandingDisplay();
+
         showToast('Company profile updated and saved successfully!');
     } catch (err) {
         console.error('Error saving profile:', err);
-        showToast('Failed to save profile', 'error');
+        showToast('Failed to save profile: ' + (err.message || 'Unknown error'), 'error');
+    } finally {
+        if (submitBtn) setBtnLoading(submitBtn, false, originalText);
     }
 }
 
@@ -3979,11 +5071,11 @@ window.openResetPasswordModal = () => {
         <form id="reset-password-form">
             <div class="form-group">
                 <label>New Password</label>
-                <input type="password" id="reset-password" required minlength="6" placeholder="Min 6 characters">
+                <input type="password" id="reset-password" required minlength="4" placeholder="Min 4 characters">
             </div>
             <div class="form-group">
                 <label>Confirm Password</label>
-                <input type="password" id="reset-password-confirm" required minlength="6" placeholder="Confirm your new password">
+                <input type="password" id="reset-password-confirm" required minlength="4" placeholder="Confirm your new password">
             </div>
             <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 1rem;">
                 <button type="submit" class="btn-primary" style="width: auto;">Update Password</button>
@@ -4006,18 +5098,20 @@ window.openResetPasswordModal = () => {
         const originalText = submitBtn.innerHTML;
         setBtnLoading(submitBtn, true, originalText);
 
-        if (supabaseClient) {
-            const { error } = await supabaseClient.auth.updateUser({ password });
-            if (error) {
-                showToast(`Error: ${error.message}`, 'error');
-            } else {
-                closeModal();
-                showToast('Password updated successfully! You can now log in with your new password.');
-                // Clear the hash from URL
-                window.history.replaceState(null, null, window.location.pathname);
+        if (state.currentUser) {
+            try {
+                const doc = await db.users.get(state.currentUser._id || state.currentUser.id.toString());
+                await db.users.put({ ...doc, password });
+            } catch (pErr) {
+                if (pErr.status === 404) {
+                    await db.users.put({ _id: state.currentUser.id.toString(), id: state.currentUser.id, email: state.currentUser.email, role: state.currentUser.role, password });
+                }
             }
+            state.currentUser.password = password;
+            closeModal();
+            showToast('Password updated successfully!');
         } else {
-            showToast('Password reset is not available in Mock Mode.', 'warning');
+            showToast('No active user logged in', 'error');
         }
         setBtnLoading(submitBtn, false, originalText);
     };
@@ -4115,171 +5209,355 @@ window.printReport = () => {
 // --- Advanced Dashboard Implementation ---
 
 window.handleDashboardFilterChange = () => {
-    const period = document.getElementById('dash-period').value;
+    const periodSelect = document.getElementById('dash-period');
+    if (!periodSelect) return;
+    const period = periodSelect.value;
+    if (!state.dashFilters) state.dashFilters = { period: 'All', startDate: '', endDate: '' };
     state.dashFilters.period = period;
-    
+
     const customDates = document.getElementById('dash-custom-dates');
-    if (period === 'Custom') {
-        customDates.classList.remove('hidden');
-    } else {
-        customDates.classList.add('hidden');
-        applyDashboardFilters();
+    if (customDates) {
+        if (period === 'Custom') customDates.classList.remove('hidden');
+        else customDates.classList.add('hidden');
     }
+
+    // Custom range needs two valid dates before the stats can be recalculated
+    if (period === 'Custom') {
+        const startVal = document.getElementById('dash-start-date')?.value || '';
+        const endVal = document.getElementById('dash-end-date')?.value || '';
+        if (!startVal || !endVal) return;
+    }
+    applyDashboardFilters();
 };
 
-window.applyDashboardFilters = () => {
-    const period = state.dashFilters.period;
-    let start = '';
-    let end = new Date().toISOString().split('T')[0];
-    const today = new Date();
+// Formats a Date object as a local YYYY-MM-DD string.
+// (toISOString() is UTC based and can shift the date by one day for IST users.)
+function toLocalISODate(dateObj) {
+    const y = dateObj.getFullYear();
+    const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const d = String(dateObj.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+}
 
-    if (period === 'Today') {
-        start = end;
-    } else if (period === 'Last7Days') {
-        const d = new Date();
-        d.setDate(d.getDate() - 7);
-        start = d.toISOString().split('T')[0];
-    } else if (period === 'ThisMonth') {
-        start = end.slice(0, 7) + '-01';
-    } else if (period === 'LastMonth') {
-        const d = new Date();
-        d.setMonth(d.getMonth() - 1);
-        const lastMonth = d.toISOString().slice(0, 7);
-        start = lastMonth + '-01';
-        const lastDay = new Date(today.getFullYear(), today.getMonth(), 0);
-        end = lastDay.toISOString().split('T')[0];
-    } else if (period === 'ThisYear') {
-        start = end.slice(0, 4) + '-01-01';
-    } else if (period === 'Custom') {
-        start = document.getElementById('dash-start-date').value;
-        end = document.getElementById('dash-end-date').value;
+// Resolves a dashboard period into an inclusive { start, end } ISO date range.
+function getDashboardDateRange(period, customStart = '', customEnd = '') {
+    const today = new Date();
+    const todayStr = toLocalISODate(today);
+    let start = '';
+    let end = todayStr;
+
+    switch (period) {
+        case 'Today':
+            start = todayStr;
+            break;
+        case 'Last7Days': {
+            const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 6);
+            start = toLocalISODate(d);
+            break;
+        }
+        case 'ThisMonth':
+            start = todayStr.slice(0, 7) + '-01';
+            break;
+        case 'LastMonth': {
+            const firstDay = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+            const lastDay = new Date(today.getFullYear(), today.getMonth(), 0);
+            start = toLocalISODate(firstDay);
+            end = toLocalISODate(lastDay);
+            break;
+        }
+        case 'ThisYear':
+            start = todayStr.slice(0, 4) + '-01-01';
+            break;
+        case 'Custom':
+            start = customStart || '';
+            end = customEnd || '';
+            break;
+        default: // 'All' → no date restriction at all
+            start = '';
+            end = '';
     }
 
-    state.dashFilters.startDate = start;
-    state.dashFilters.endDate = end;
+    return { start, end };
+}
+
+// Universal Amount Parser & Date Normalizer
+function parseAmount(val) {
+    if (val === undefined || val === null || val === '') return 0;
+    if (typeof val === 'number') return isNaN(val) ? 0 : val;
+    const clean = String(val).replace(/[^0-9.-]+/g, '');
+    const num = parseFloat(clean);
+    return isNaN(num) ? 0 : num;
+}
+
+// Normalizes almost any stored date value into an ISO YYYY-MM-DD string.
+// Handles ISO timestamps, YYYY/MM/DD, DD/MM/YYYY, DD-MM-YYYY and Date objects
+// so records imported from Excel still match the dashboard date filters.
+function normalizeDate(dStr) {
+    if (!dStr) return '';
+    if (dStr instanceof Date) return isNaN(dStr.getTime()) ? '' : toLocalISODate(dStr);
+
+    const value = String(dStr).trim();
+    if (!value) return '';
+
+    // ISO timestamp → take the date part: "2026-11-06T10:20:30.000Z"
+    if (value.includes('T')) {
+        const isoPart = value.split('T')[0];
+        if (/^\d{4}-\d{2}-\d{2}$/.test(isoPart)) return isoPart;
+    }
+
+    // Already ISO: "2026-11-06"
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+
+    // Year first with slashes/dots: "2026/11/06" or "2026.11.06"
+    const ymd = value.match(/^(\d{4})[/.](\d{1,2})[/.](\d{1,2})/);
+    if (ymd) {
+        return `${ymd[1]}-${ymd[2].padStart(2, '0')}-${ymd[3].padStart(2, '0')}`;
+    }
+
+    // Day first: "06/11/2026", "6-11-2026" or "06.11.2026"
+    const dmy = value.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+    if (dmy) {
+        return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+    }
+
+    // Fallback: let the browser parse it ("06 Nov 2026", "Nov 6, 2026", ...)
+    const parsed = new Date(value);
+    if (!isNaN(parsed.getTime())) return toLocalISODate(parsed);
+
+    return value;
+}
+
+// Currency formatter used by the dashboard KPI cards and top lists.
+function formatCurrency(amount) {
+    const value = parseAmount(amount);
+    return `₹ ${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// Writes text into an element if it exists on the current page.
+function setTextById(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+    return !!el;
+}
+
+// Human readable label for the currently selected dashboard period.
+function getDashboardPeriodLabel() {
+    const period = (state.dashFilters && state.dashFilters.period) || 'All';
+    const labels = {
+        All: 'all time',
+        Today: 'today',
+        Last7Days: 'the last 7 days',
+        ThisMonth: 'this month',
+        LastMonth: 'last month',
+        ThisYear: 'this year',
+        Custom: 'the selected date range'
+    };
+    return labels[period] || 'the selected period';
+}
+
+window.applyDashboardFilters = () => {
+    if (!state.dashFilters) state.dashFilters = { period: 'All', startDate: '', endDate: '' };
+    const period = state.dashFilters.period || 'All';
+
+    const startInput = document.getElementById('dash-start-date');
+    const endInput = document.getElementById('dash-end-date');
+    const range = getDashboardDateRange(
+        period,
+        startInput ? startInput.value : '',
+        endInput ? endInput.value : ''
+    );
+
+    state.dashFilters.startDate = range.start;
+    state.dashFilters.endDate = range.end;
+
+    // Keep the filter bar in sync with the active period
+    const periodSelect = document.getElementById('dash-period');
+    if (periodSelect && periodSelect.value !== period) periodSelect.value = period;
+    const customDates = document.getElementById('dash-custom-dates');
+    if (customDates) {
+        if (period === 'Custom') customDates.classList.remove('hidden');
+        else customDates.classList.add('hidden');
+    }
 
     updateDashboardStats();
     renderDashboardCharts();
 };
 
 function getFilteredDataForDashboard(dataArray, dateKey = 'date') {
-    const { startDate, endDate, period } = state.dashFilters;
-    if (period === 'All') return dataArray;
-    if (!startDate || !endDate) return dataArray;
-    
+    if (!Array.isArray(dataArray)) return [];
+    const filters = state.dashFilters || {};
+    const startDate = filters.startDate || '';
+    const endDate = filters.endDate || '';
+
+    // 'All Time' (or an incomplete custom range) → use every record
+    if (filters.period === 'All' || (!startDate && !endDate)) return dataArray.slice();
+
     return dataArray.filter(item => {
-        const d = item[dateKey];
-        return d >= startDate && d <= endDate;
+        if (!item) return false;
+        const rawDate = item[dateKey] || item.createdAt || item.created_at || item.updatedAt || '';
+        const d = normalizeDate(rawDate);
+        if (!d) return true; // records without a date always count
+        if (startDate && d < startDate) return false;
+        if (endDate && d > endDate) return false;
+        return true;
     });
 }
 
 function updateDashboardStats() {
-    const filteredSales = getFilteredDataForDashboard(state.sales);
-    const filteredPurchases = getFilteredDataForDashboard(state.purchases);
-    const filteredExpenses = getFilteredDataForDashboard(state.expenses);
+    // Defensive: the dashboard must never blow up because a collection is missing
+    const sales = Array.isArray(state.sales) ? state.sales : [];
+    const purchases = Array.isArray(state.purchases) ? state.purchases : [];
+    const expenses = Array.isArray(state.expenses) ? state.expenses : [];
+    const inventory = Array.isArray(state.inventory) ? state.inventory : [];
+    const customers = Array.isArray(state.customers) ? state.customers : [];
+    const suppliers = Array.isArray(state.suppliers) ? state.suppliers : [];
 
-    // 1. Financial KPIs
-    const totalRevenue = filteredSales.reduce((sum, s) => sum + (parseFloat(s.total) || 0), 0);
-    const totalExpenses = filteredExpenses.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
-    const netProfit = totalRevenue - totalExpenses;
-    const margin = totalRevenue > 0 ? (netProfit / totalRevenue * 100).toFixed(1) : 0;
+    const filteredSales = getFilteredDataForDashboard(sales);
+    const filteredPurchases = getFilteredDataForDashboard(purchases);
+    const filteredExpenses = getFilteredDataForDashboard(expenses);
 
-    const revEl = document.getElementById('dash-revenue');
-    const expEl = document.getElementById('dash-expenses');
-    const profEl = document.getElementById('dash-profit');
-    const margEl = document.getElementById('dash-margin');
+    try {
+        // 1. Financial KPIs (Real-Time from Sales, Purchases, and Expenses)
+        const totalRevenue = filteredSales.reduce((sum, s) => sum + parseAmount(s.total), 0);
+        const purchaseExpenses = filteredPurchases.reduce((sum, p) => sum + parseAmount(p.total), 0);
+        const generalExpenses = filteredExpenses.reduce((sum, e) => sum + parseAmount(e.amount), 0);
+        const totalExpenses = purchaseExpenses + generalExpenses;
+        const netProfit = totalRevenue - totalExpenses;
+        const margin = totalRevenue > 0 ? ((netProfit / totalRevenue) * 100).toFixed(1) : '0.0';
 
-    if (revEl) revEl.textContent = `₹ ${totalRevenue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-    if (expEl) expEl.textContent = `₹ ${totalExpenses.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-    if (profEl) profEl.textContent = `₹ ${netProfit.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-    if (margEl) margEl.textContent = `${margin}%`;
+        setTextById('dash-revenue', formatCurrency(totalRevenue));
+        setTextById('dash-expenses', formatCurrency(totalExpenses));
+        setTextById('dash-profit', formatCurrency(netProfit));
+        setTextById('dash-margin', `${margin}%`);
 
-    // Visual coloring for Profit/Loss
-    const profitCard = document.querySelector('.kpi-card.profit');
-    if (profitCard && profEl) {
-        if (netProfit < 0) {
-            profitCard.style.borderTopColor = 'var(--danger)';
-            profEl.classList.add('text-danger');
-        } else {
-            profitCard.style.borderTopColor = 'var(--success)';
-            profEl.classList.remove('text-danger');
+        // Visual coloring for Profit/Loss
+        const profEl = document.getElementById('dash-profit');
+        const profitCard = document.querySelector('.kpi-card.profit');
+        if (profitCard && profEl) {
+            if (netProfit < 0) {
+                profitCard.style.borderTopColor = 'var(--danger)';
+                profEl.classList.add('text-danger');
+            } else {
+                profitCard.style.borderTopColor = 'var(--success)';
+                profEl.classList.remove('text-danger');
+            }
         }
+    } catch (err) {
+        console.error('Error calculating dashboard financial KPIs:', err);
     }
 
-    // 2. Operational Stats
-    const lowStockCount = state.inventory.filter(p => p.stock < p.minStock).length;
-    const pendingRev = state.sales.filter(s => s.status === 'Pending').reduce((sum, s) => sum + (parseFloat(s.total) || 0), 0);
-    const pendingPay = state.purchases.filter(p => p.status === 'Pending').reduce((sum, p) => sum + (parseFloat(p.total) || 0), 0);
-    const invValue = state.inventory.reduce((sum, p) => sum + ((parseFloat(p.stock) || 0) * (parseFloat(p.price) || 0)), 0);
+    try {
+        // 2. Operational Stats
+        const totalProducts = inventory.length;
+        const totalCustomers = customers.length;
+        const totalSuppliers = suppliers.length;
+        const lowStockCount = inventory.filter(p => {
+            if (!p) return false;
+            const stock = parseAmount(p.stock);
+            const hasMin = p.minStock !== undefined && p.minStock !== null && p.minStock !== '';
+            const minStock = hasMin ? parseAmount(p.minStock) : 0;
+            return minStock > 0 && stock < minStock;
+        }).length;
 
-    const lowStockEl = document.getElementById('dash-low-stock');
-    const pendRevEl = document.getElementById('dash-pending-rev');
-    const pendPayEl = document.getElementById('dash-pending-pay');
-    const invValEl = document.getElementById('dash-inv-value');
+        const pendingRev = filteredSales.reduce((sum, s) => {
+            if (s.pendingAmount !== undefined && s.pendingAmount !== null && s.pendingAmount !== '') {
+                return sum + parseAmount(s.pendingAmount);
+            }
+            return sum + (s.status !== 'Paid' ? parseAmount(s.total) : 0);
+        }, 0);
+        const pendingPay = filteredPurchases.reduce((sum, p) => {
+            if (p.pendingAmount !== undefined && p.pendingAmount !== null && p.pendingAmount !== '') {
+                return sum + parseAmount(p.pendingAmount);
+            }
+            return sum + (p.status !== 'Paid' ? parseAmount(p.total) : 0);
+        }, 0);
+        const invValue = inventory.reduce((sum, p) => sum + (parseAmount(p.stock) * parseAmount(p.price)), 0);
 
-    if (lowStockEl) lowStockEl.textContent = lowStockCount;
-    if (pendRevEl) pendRevEl.textContent = `₹ ${pendingRev.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-    if (pendPayEl) pendPayEl.textContent = `₹ ${pendingPay.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
-    if (invValEl) invValEl.textContent = `₹ ${invValue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+        setTextById('dash-total-products', totalProducts);
+        setTextById('dash-total-customers', totalCustomers);
+        setTextById('dash-total-suppliers', totalSuppliers);
+        setTextById('dash-low-stock', lowStockCount);
+        setTextById('dash-pending-rev', formatCurrency(pendingRev));
+        setTextById('dash-pending-pay', formatCurrency(pendingPay));
+        setTextById('dash-inv-value', formatCurrency(invValue));
+    } catch (err) {
+        console.error('Error calculating dashboard operational stats:', err);
+    }
 
-    // 3. Top Lists
-    renderTopLists(filteredSales);
+    try {
+        // 3. Top Lists (products + customers)
+        renderTopLists(filteredSales);
+    } catch (err) {
+        console.error('Error rendering dashboard top lists:', err);
+    }
+}
+
+// Renders an explanatory empty state for a dashboard list card.
+function renderDashboardListEmpty(containerId, fallbackText, totalRecords) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    const periodLabel = getDashboardPeriodLabel();
+    let message = fallbackText.replace('{period}', periodLabel);
+    if (totalRecords > 0 && periodLabel !== 'all time') {
+        message += ` ${totalRecords} record${totalRecords === 1 ? '' : 's'} exist outside this period — choose "All Time".`;
+    }
+    container.innerHTML = `<p class="text-muted">${message}</p>`;
+}
+
+function renderDashboardList(containerId, rows) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.innerHTML = rows.map(([name, value]) => `
+        <div class="dash-list-item">
+            <span class="item-name">${name}</span>
+            <span class="item-value">${formatCurrency(value)}</span>
+        </div>
+    `).join('');
 }
 
 function renderTopLists(filteredSales) {
-    // Top Products
+    const sales = Array.isArray(filteredSales) ? filteredSales : [];
+    const totalSalesRecords = Array.isArray(state.sales) ? state.sales.length : 0;
+
+    // ── Top Products (by revenue) ──────────────────────────────────────────
     const productMap = {};
-    filteredSales.forEach(sale => {
-        if (sale.items && Array.isArray(sale.items)) {
-            sale.items.forEach(item => {
-                const name = item.name || 'Unknown Product';
-                const revenue = (parseFloat(item.total) || 0);
-                productMap[name] = (productMap[name] || 0) + revenue;
-            });
-        }
+    sales.forEach(sale => {
+        if (!sale || !Array.isArray(sale.items)) return;
+        sale.items.forEach(item => {
+            if (!item) return;
+            const name = item.name || item.product || item.code || 'Unknown Product';
+            // Some records only store qty/price — fall back to qty × price
+            const revenue = parseAmount(item.total) || (parseAmount(item.qty) * parseAmount(item.price));
+            productMap[name] = (productMap[name] || 0) + revenue;
+        });
     });
 
     const topProducts = Object.entries(productMap)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 5);
 
-    const productContainer = document.getElementById('dash-top-products');
-    if (productContainer) {
-        if (topProducts.length === 0) {
-            productContainer.innerHTML = '<p class="text-muted">No sales data for this period.</p>';
-        } else {
-            productContainer.innerHTML = topProducts.map(([name, val]) => `
-                <div class="dash-list-item">
-                    <span class="item-name">${name}</span>
-                    <span class="item-value">₹ ${val.toLocaleString('en-IN')}</span>
-                </div>
-            `).join('');
-        }
+    if (topProducts.length === 0) {
+        renderDashboardListEmpty('dash-top-products', 'No sales data for {period}.', totalSalesRecords);
+    } else {
+        renderDashboardList('dash-top-products', topProducts);
     }
 
-    // Top Customers
+    // ── Top Customers ──────────────────────────────────────────────────────
     const customerMap = {};
-    filteredSales.forEach(sale => {
-        const name = sale.customer || 'Guest';
-        customerMap[name] = (customerMap[name] || 0) + (parseFloat(sale.total) || 0);
+    sales.forEach(sale => {
+        if (!sale) return;
+        const name = sale.customer || (sale.customerObj && sale.customerObj.name) || 'Guest';
+        customerMap[name] = (customerMap[name] || 0) + parseAmount(sale.total);
     });
 
     const topCustomers = Object.entries(customerMap)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 5);
 
-    const customerContainer = document.getElementById('dash-top-customers');
-    if (customerContainer) {
-        if (topCustomers.length === 0) {
-            customerContainer.innerHTML = '<p class="text-muted">No customer data for this period.</p>';
-        } else {
-            customerContainer.innerHTML = topCustomers.map(([name, val]) => `
-                <div class="dash-list-item">
-                    <span class="item-name">${name}</span>
-                    <span class="item-value">₹ ${val.toLocaleString('en-IN')}</span>
-                </div>
-            `).join('');
-        }
+    if (topCustomers.length === 0) {
+        renderDashboardListEmpty('dash-top-customers', 'No customer data for {period}.', totalSalesRecords);
+    } else {
+        renderDashboardList('dash-top-customers', topCustomers);
     }
 }
 
@@ -4288,40 +5566,64 @@ function renderDashboardCharts() {
         const salesCanvas = document.getElementById('salesChart');
         const expenseCanvas = document.getElementById('expenseChart');
         if (!salesCanvas || !expenseCanvas) return;
+        if (typeof Chart === 'undefined') {
+            console.warn('Chart.js is not loaded — dashboard charts skipped.');
+            return;
+        }
+
+        const salesRecords = Array.isArray(state.sales) ? state.sales : [];
+        const expenseRecords = Array.isArray(state.expenses) ? state.expenses : [];
+        const purchaseRecords = Array.isArray(state.purchases) ? state.purchases : [];
 
         // 1. Sales Trend Data
-        const { startDate, endDate, period } = state.dashFilters;
+        const { startDate, endDate, period } = state.dashFilters || {};
         let labels = [];
         let dataset = [];
 
         if (period === 'Today') {
             labels = ['Today'];
-            const todayTotal = state.sales.filter(s => s.date === startDate).reduce((sum, s) => sum + (parseFloat(s.total) || 0), 0);
+            const todayTotal = salesRecords
+                .filter(s => normalizeDate(s.date) === startDate)
+                .reduce((sum, s) => sum + parseAmount(s.total), 0);
             dataset = [todayTotal];
         } else if (period === 'Last7Days' || (period === 'Custom' && startDate && endDate && (new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24) <= 14)) {
-            // Day-wise trend
-            const dStart = new Date(startDate);
-            const dEnd = new Date(endDate);
-            for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
-                const dateStr = d.toISOString().split('T')[0];
-                labels.push(d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }));
-                const dailyTotal = state.sales.filter(s => s.date === dateStr).reduce((sum, s) => sum + (parseFloat(s.total) || 0), 0);
-                dataset.push(dailyTotal);
+            const dStart = new Date(startDate + 'T00:00:00');
+            const dEnd = new Date(endDate + 'T00:00:00');
+            if (!isNaN(dStart.getTime()) && !isNaN(dEnd.getTime()) && dStart <= dEnd) {
+                for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
+                    const dateStr = toLocalISODate(d);
+                    labels.push(d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }));
+                    const dailyTotal = salesRecords
+                        .filter(s => normalizeDate(s.date) === dateStr)
+                        .reduce((sum, s) => sum + parseAmount(s.total), 0);
+                    dataset.push(dailyTotal);
+                }
+            }
+            if (labels.length === 0) {
+                labels = ['No Data'];
+                dataset = [0];
             }
         } else {
-            // Month-wise trend
             const monthMap = {};
-            const salesInScope = getFilteredDataForDashboard(state.sales);
+            const salesInScope = getFilteredDataForDashboard(salesRecords);
             salesInScope.forEach(s => {
-                const m = s.date.slice(0, 7); // YYYY-MM
-                monthMap[m] = (monthMap[m] || 0) + (parseFloat(s.total) || 0);
+                const normD = normalizeDate(s && s.date);
+                const m = normD ? normD.slice(0, 7) : 'Recent';
+                monthMap[m] = (monthMap[m] || 0) + parseAmount(s.total);
             });
-            labels = Object.keys(monthMap).sort();
-            dataset = labels.map(m => monthMap[m]);
-            labels = labels.map(m => {
-                const [y, mm] = m.split('-');
-                return new Date(y, parseInt(mm) - 1).toLocaleString('default', { month: 'short' });
+            const sortedKeys = Object.keys(monthMap).sort();
+            labels = sortedKeys.map(m => {
+                if (m.includes('-')) {
+                    const [y, mm] = m.split('-');
+                    return new Date(parseInt(y), parseInt(mm) - 1).toLocaleString('default', { month: 'short' });
+                }
+                return m;
             });
+            dataset = sortedKeys.map(m => monthMap[m]);
+            if (labels.length === 0) {
+                labels = ['No Data'];
+                dataset = [0];
+            }
         }
 
         const salesCtx = salesCanvas.getContext('2d');
@@ -4353,12 +5655,24 @@ function renderDashboardCharts() {
             }
         });
 
-        // 2. Expense Breakdown
-        const filteredExpenses = getFilteredDataForDashboard(state.expenses);
+        // 2. Expense Breakdown (Purchases + General Expenses)
+        const filteredExpenses = getFilteredDataForDashboard(expenseRecords);
+        const filteredPurchases = getFilteredDataForDashboard(purchaseRecords);
         const expenseMap = {};
+        
+        const purchaseTotal = filteredPurchases.reduce((sum, p) => sum + parseAmount(p.total), 0);
+        if (purchaseTotal > 0) {
+            expenseMap['Purchases / Stock'] = purchaseTotal;
+        }
+
         filteredExpenses.forEach(e => {
-            expenseMap[e.category] = (expenseMap[e.category] || 0) + (parseFloat(e.amount) || 0);
+            const cat = e.category || 'General Expense';
+            expenseMap[cat] = (expenseMap[cat] || 0) + parseAmount(e.amount);
         });
+
+        if (Object.keys(expenseMap).length === 0) {
+            expenseMap['No Expenses'] = 0;
+        }
 
         const expenseCtx = expenseCanvas.getContext('2d');
         if (window.myExpenseChart) window.myExpenseChart.destroy();
@@ -4368,7 +5682,7 @@ function renderDashboardCharts() {
                 labels: Object.keys(expenseMap),
                 datasets: [{ 
                     data: Object.values(expenseMap), 
-                    backgroundColor: ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6'] 
+                    backgroundColor: ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#6366f1'] 
                 }]
             },
             options: { 
@@ -4384,6 +5698,427 @@ function renderDashboardCharts() {
         console.error('Error rendering dashboard charts:', err);
     }
 }
+
+// ─── Single Invoice Word (.docx) & Excel (.xlsx) Export ────────────────────────
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function getInvoiceExportData(id, type = 'Sales') {
+    const isPurchase = type === 'Purchases';
+    const record = isPurchase ? state.purchases.find(p => p.id === id) : state.sales.find(s => s.id === id);
+    if (!record) return null;
+
+    let party = isPurchase ? record.supplierObj : record.customerObj;
+    if (isPurchase) {
+        const fresh = state.suppliers.find(s => s.name === record.supplier || (party && s.id == party.id));
+        if (fresh) party = fresh;
+        if (!party) party = { name: record.supplier || 'N/A', address: 'N/A', gstin: 'N/A', state: 'N/A' };
+    } else {
+        const fresh = state.customers.find(c => c.name === record.customer || (party && c.id == party.id));
+        if (fresh) party = fresh;
+        if (!party) party = { name: record.customer || 'N/A', address: 'N/A', gstin: 'N/A', state: 'N/A' };
+    }
+
+    const comp = state.company || {};
+    const items = record.items || [];
+    const subtotal = parseAmount(record.subtotal);
+    const tax = parseAmount(record.tax);
+    const total = parseAmount(record.total);
+    const billType = record.billType || 'GST Bill';
+    const gstType = record.gstType || 'Local';
+    const no = record.id;
+    const date = record.date;
+    const paymentMode = record.paymentMode || '';
+    const shipTo = record.shipTo || '';
+    const supplyState = party.state || (isPurchase ? comp.state : (party.address && party.address.split(',').pop().trim()) || comp.state || 'N/A');
+
+    return {
+        id,
+        no,
+        date,
+        type,
+        isPurchase,
+        party,
+        comp,
+        items,
+        subtotal,
+        tax,
+        total,
+        billType,
+        gstType,
+        paymentMode,
+        shipTo,
+        supplyState,
+        amountWords: typeof amountToWords === 'function' ? amountToWords(total) : `₹ ${total.toFixed(2)}`
+    };
+}
+
+window.exportInvoiceToWord = async (id, type = 'Sales') => {
+    try {
+        const inv = getInvoiceExportData(id, type);
+        if (!inv) {
+            showToast('Invoice record not found', 'error');
+            return;
+        }
+
+        const isPurchase = inv.isPurchase;
+        const comp = inv.comp;
+        const party = inv.party;
+        const items = inv.items;
+        const title = isPurchase ? 'PURCHASE BILL' : (inv.billType === 'Non-GST Bill' ? 'INVOICE' : 'TAX INVOICE');
+
+        const htmlDoc = `<!DOCTYPE html>
+<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+<head>
+<meta charset='utf-8'>
+<title>${title} - ${inv.no}</title>
+<!--[if gte mso 9]>
+<xml>
+<w:WordDocument>
+<w:View>Print</w:View>
+<w:Zoom>100</w:Zoom>
+<w:DoNotOptimizeForBrowser/>
+</w:WordDocument>
+</xml>
+<![endif]-->
+<style>
+@page { size: 210mm 297mm; margin: 15mm; }
+body { font-family: 'Segoe UI', Calibri, Arial, sans-serif; color: #1e293b; font-size: 9.5pt; line-height: 1.4; margin: 0; padding: 0; }
+.title { text-align: center; font-size: 16pt; font-weight: bold; margin-bottom: 12px; text-transform: uppercase; color: #0f172a; }
+table { width: 100%; border-collapse: collapse; border: 1px solid #94a3b8; margin-bottom: 0px; }
+th, td { border: 1px solid #94a3b8; padding: 6px 8px; font-size: 9pt; }
+th { background-color: #f1f5f9; font-weight: bold; text-align: center; color: #334155; }
+.header-box { background-color: #f8fafc; }
+.bold { font-weight: bold; }
+.right { text-align: right; }
+.center { text-align: center; }
+.section-head { background-color: #e2e8f0; font-weight: bold; padding: 4px 8px; text-transform: uppercase; font-size: 8.5pt; color: #334155; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<div class="title">${title}</div>
+
+<table>
+  <tr class="header-box">
+    <td style="width: 50%; vertical-align: top; border-bottom: none;">
+      <div style="font-size: 14pt; font-weight: bold; color: #0f172a;">${comp.name || 'Company Name'}</div>
+    </td>
+    <td style="width: 50%; vertical-align: top; text-align: right; border-bottom: none;">
+      <div style="font-weight: bold; font-size: 11pt; color: #1e293b;">${comp.legalName || comp.name || ''}</div>
+      <div>${comp.address || ''}</div>
+      <div>Phone: ${comp.phone || ''} | Email: ${comp.email || ''}</div>
+      ${comp.website ? `<div>Website: ${comp.website}</div>` : ''}
+      <div>GSTIN: ${comp.gstin || 'N/A'}, State: ${comp.state || 'N/A'}</div>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td style="width: ${inv.shipTo ? '35%' : '50%'}; vertical-align: top;">
+      <div class="section-head">Bill To</div>
+      <div class="bold" style="font-size: 10.5pt; margin: 3px 0;">${party.name || 'N/A'}</div>
+      <div>${(party.address || 'N/A').replace(/\r?\n/g, '<br>')}</div>
+      ${inv.billType !== 'Non-GST Bill' ? `<div>GSTIN: ${party.gstin || 'N/A'}</div>` : ''}
+      <div>State: ${party.state || 'N/A'}</div>
+    </td>
+    ${inv.shipTo ? `
+    <td style="width: 35%; vertical-align: top;">
+      <div class="section-head">Ship To</div>
+      <div style="margin: 3px 0;">${inv.shipTo.replace(/\r?\n/g, '<br>')}</div>
+    </td>` : ''}
+    <td style="width: ${inv.shipTo ? '30%' : '50%'}; vertical-align: top;">
+      <div class="section-head">Invoice Details</div>
+      <div style="margin-top: 3px;"><strong>Invoice No:</strong> ${inv.no}</div>
+      <div><strong>Date:</strong> ${inv.date}</div>
+      <div><strong>Place of Supply:</strong> ${inv.supplyState}</div>
+      ${inv.paymentMode ? `<div><strong>Payment Mode:</strong> ${inv.paymentMode}</div>` : ''}
+    </td>
+  </tr>
+</table>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width: 5%;">#</th>
+      <th style="width: 38%; text-align: left;">Description of Goods</th>
+      <th style="width: 12%;">HSN/SAC</th>
+      <th style="width: 8%;">Qty</th>
+      <th style="width: 12%;">Rate (₹)</th>
+      ${inv.billType === 'Non-GST Bill' ? '' : (inv.gstType === 'Local' ? '<th style="width: 8%;">CGST %</th><th style="width: 8%;">SGST %</th>' : '<th style="width: 10%;">IGST %</th>')}
+      <th style="width: 15%;">Amount (₹)</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${items.map((it, idx) => `
+      <tr>
+        <td class="center">${idx + 1}</td>
+        <td>${it.name || ''}</td>
+        <td class="center">${it.hsn || ''}</td>
+        <td class="center">${it.qty || 1}</td>
+        <td class="right">₹ ${parseFloat(it.price || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+        ${inv.billType === 'Non-GST Bill' ? '' : (inv.gstType === 'Local' ? `<td class="center">${(parseFloat(it.tax || 0)/2).toFixed(1)}%</td><td class="center">${(parseFloat(it.tax || 0)/2).toFixed(1)}%</td>` : `<td class="center">${parseFloat(it.tax || 0).toFixed(1)}%</td>`)}
+        <td class="right">₹ ${parseFloat(it.total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+      </tr>
+    `).join('')}
+  </tbody>
+</table>
+
+<table>
+  <tr>
+    <td style="width: 60%; vertical-align: top;">
+      <div class="section-head">Invoice Amount in Words</div>
+      <div class="bold" style="padding: 4px 0;">${inv.amountWords || ''}</div>
+      ${comp.terms ? `<div class="section-head" style="margin-top: 8px;">Terms and Conditions</div><div style="white-space: pre-wrap;">${comp.terms}</div>` : ''}
+    </td>
+    <td style="width: 40%; vertical-align: top;">
+      <div class="section-head">Amounts</div>
+      <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+        <span>Sub Total:</span> <strong>₹ ${inv.subtotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+      </div>
+      ${inv.billType !== 'Non-GST Bill' ? (inv.gstType === 'Local' ? `
+        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+          <span>CGST:</span> <strong>₹ ${(inv.tax/2).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+          <span>SGST:</span> <strong>₹ ${(inv.tax/2).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        </div>
+      ` : `
+        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+          <span>IGST:</span> <strong>₹ ${inv.tax.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+        </div>
+      `) : ''}
+      <div style="display: flex; justify-content: space-between; font-size: 11pt; border-top: 2px solid #94a3b8; padding-top: 4px; margin-top: 4px;">
+        <span><strong>Total:</strong></span> <strong>₹ ${inv.total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</strong>
+      </div>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td style="width: 60%; vertical-align: top;">
+      <div class="section-head">Bank Details</div>
+      <div><strong>Bank Name:</strong> ${comp.bankName || 'N/A'}</div>
+      ${comp.branchAddress ? `<div><strong>Branch:</strong> ${comp.branchAddress}</div>` : ''}
+      <div><strong>Account No:</strong> ${comp.accountNo || 'N/A'}</div>
+      <div><strong>IFSC Code:</strong> ${comp.ifscCode || 'N/A'}</div>
+      <div><strong>Account Holder:</strong> ${comp.accountHolder || comp.legalName || 'N/A'}</div>
+    </td>
+    <td style="width: 40%; vertical-align: bottom; text-align: center;">
+      <div class="bold">For : ${comp.legalName || comp.name || ''}</div>
+      <div style="height: 45px;"></div>
+      <div style="border-top: 1px solid #94a3b8; padding-top: 4px; font-size: 8.5pt; font-weight: bold;">Authorized Signatory</div>
+    </td>
+  </tr>
+</table>
+
+</body>
+</html>`;
+
+        const filename = `${isPurchase ? 'Purchase_Bill' : 'Invoice'}_${inv.no}.docx`;
+
+        if (window.JSZip) {
+            const zip = new window.JSZip();
+            zip.file('[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="html" ContentType="text/html"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`);
+
+            zip.file('_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`);
+
+            zip.file('word/_rels/document.xml.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="htmlChunk" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk" Target="htmlDoc.html"/>
+</Relationships>`);
+
+            zip.file('word/document.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:altChunk r:id="htmlChunk"/>
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720"/>
+    </w:sectPr>
+  </w:body>
+</w:document>`);
+
+            zip.file('word/htmlDoc.html', htmlDoc);
+
+            const content = await zip.generateAsync({
+                type: 'blob',
+                mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            });
+            downloadBlob(content, filename);
+        } else {
+            const blob = new Blob(['\ufeff', htmlDoc], { type: 'application/msword;charset=utf-8' });
+            downloadBlob(blob, filename);
+        }
+
+        showToast(`Invoice ${inv.no} exported to Word (.docx)`);
+    } catch (err) {
+        console.error('Error exporting invoice to Word:', err);
+        showToast('Failed to export invoice to Word', 'error');
+    }
+};
+
+window.exportInvoiceToExcel = (id, type = 'Sales') => {
+    try {
+        if (!window.XLSX) {
+            showToast('Excel export library not available', 'error');
+            return;
+        }
+
+        const inv = getInvoiceExportData(id, type);
+        if (!inv) {
+            showToast('Invoice record not found', 'error');
+            return;
+        }
+
+        const isPurchase = inv.isPurchase;
+        const comp = inv.comp;
+        const party = inv.party;
+        const items = inv.items;
+        const isLocal = inv.gstType === 'Local';
+        const isGST = inv.billType !== 'Non-GST Bill';
+        const title = isPurchase ? 'PURCHASE BILL' : (isGST ? 'TAX INVOICE' : 'INVOICE');
+
+        const aoa = [];
+        aoa.push([title]);
+        aoa.push([comp.legalName || comp.name || 'Company Name']);
+        aoa.push([comp.address || '']);
+        aoa.push([`Phone: ${comp.phone || ''} | Email: ${comp.email || ''}${comp.website ? ' | Website: ' + comp.website : ''}`]);
+        aoa.push([`GSTIN: ${comp.gstin || 'N/A'} | State: ${comp.state || 'N/A'}`]);
+        aoa.push([]);
+
+        // Billing & Invoice Details
+        aoa.push(['BILL TO:', '', '', '', 'INVOICE DETAILS:']);
+        aoa.push(['Name:', party.name || 'N/A', '', '', 'Invoice No:', inv.no]);
+        aoa.push(['Address:', (party.address || 'N/A').replace(/\r?\n/g, ', '), '', '', 'Date:', inv.date]);
+        aoa.push(['GSTIN:', party.gstin || 'N/A', '', '', 'Place of Supply:', inv.supplyState]);
+        aoa.push(['State:', party.state || 'N/A', '', '', 'Payment Mode:', inv.paymentMode || 'N/A']);
+        if (inv.shipTo) {
+            aoa.push(['SHIP TO:', inv.shipTo.replace(/\r?\n/g, ', ')]);
+        }
+        aoa.push([]);
+
+        // Items Table Header
+        if (!isGST) {
+            aoa.push(['#', 'Description of Goods', 'HSN/SAC', 'Qty', 'Rate (₹)', 'Amount (₹)']);
+            items.forEach((it, idx) => {
+                aoa.push([
+                    idx + 1,
+                    it.name || '',
+                    it.hsn || '',
+                    parseFloat(it.qty) || 1,
+                    parseFloat(it.price) || 0,
+                    parseFloat(it.total) || 0
+                ]);
+            });
+        } else if (isLocal) {
+            aoa.push(['#', 'Description of Goods', 'HSN/SAC', 'Qty', 'Rate (₹)', 'CGST %', 'SGST %', 'Amount (₹)']);
+            items.forEach((it, idx) => {
+                const halfRate = (parseFloat(it.tax || 0) / 2);
+                aoa.push([
+                    idx + 1,
+                    it.name || '',
+                    it.hsn || '',
+                    parseFloat(it.qty) || 1,
+                    parseFloat(it.price) || 0,
+                    `${halfRate.toFixed(1)}%`,
+                    `${halfRate.toFixed(1)}%`,
+                    parseFloat(it.total) || 0
+                ]);
+            });
+        } else {
+            aoa.push(['#', 'Description of Goods', 'HSN/SAC', 'Qty', 'Rate (₹)', 'IGST %', 'Amount (₹)']);
+            items.forEach((it, idx) => {
+                aoa.push([
+                    idx + 1,
+                    it.name || '',
+                    it.hsn || '',
+                    parseFloat(it.qty) || 1,
+                    parseFloat(it.price) || 0,
+                    `${parseFloat(it.tax || 0).toFixed(1)}%`,
+                    parseFloat(it.total) || 0
+                ]);
+            });
+        }
+
+        aoa.push([]);
+        // Totals
+        const totalColIdx = (!isGST ? 4 : (isLocal ? 6 : 5));
+        const emptyLead = Array(totalColIdx).fill('');
+        
+        aoa.push([...emptyLead, 'Sub Total (₹):', inv.subtotal]);
+        if (isGST) {
+            if (isLocal) {
+                aoa.push([...emptyLead, 'CGST (₹):', inv.tax / 2]);
+                aoa.push([...emptyLead, 'SGST (₹):', inv.tax / 2]);
+            } else {
+                aoa.push([...emptyLead, 'IGST (₹):', inv.tax]);
+            }
+        }
+        aoa.push([...emptyLead, 'GRAND TOTAL (₹):', inv.total]);
+        aoa.push(['Amount in Words:', inv.amountWords || '']);
+        aoa.push([]);
+
+        // Bank Details & Signatory
+        aoa.push(['BANK DETAILS:', '', '', '', `FOR ${comp.legalName || comp.name || ''}:`]);
+        aoa.push(['Bank Name:', comp.bankName || 'N/A']);
+        if (comp.branchAddress) {
+            aoa.push(['Branch Address:', comp.branchAddress]);
+        }
+        aoa.push(['Account No:', comp.accountNo || 'N/A']);
+        aoa.push(['IFSC Code:', comp.ifscCode || 'N/A']);
+        aoa.push(['A/C Holder:', comp.accountHolder || comp.legalName || 'N/A', '', '', 'Authorized Signatory']);
+        if (comp.terms) {
+            aoa.push([]);
+            aoa.push(['Terms and Conditions:', comp.terms]);
+        }
+
+        const ws = XLSX.utils.aoa_to_sheet(aoa);
+        ws['!cols'] = [
+            { wch: 6 },
+            { wch: 38 },
+            { wch: 14 },
+            { wch: 10 },
+            { wch: 16 },
+            { wch: 12 },
+            { wch: 12 },
+            { wch: 18 }
+        ];
+
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Invoice");
+        const filename = `${isPurchase ? 'Purchase_Bill' : 'Invoice'}_${inv.no}.xlsx`;
+        XLSX.writeFile(wb, filename);
+        showToast(`Invoice ${inv.no} exported to Excel (.xlsx)`);
+    } catch (err) {
+        console.error('Error exporting invoice to Excel:', err);
+        showToast('Failed to export invoice to Excel', 'error');
+    }
+};
+
+window.exportSaleToWord = (id) => window.exportInvoiceToWord(id, 'Sales');
+window.exportSaleToExcelInvoice = (id) => window.exportInvoiceToExcel(id, 'Sales');
+window.exportPurchaseToWord = (id) => window.exportInvoiceToWord(id, 'Purchases');
+window.exportPurchaseToExcelInvoice = (id) => window.exportInvoiceToExcel(id, 'Purchases');
 
 // Excel Export Functions
 window.exportSalesToExcel = () => {
